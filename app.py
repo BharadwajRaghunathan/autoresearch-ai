@@ -1,25 +1,54 @@
 """
 app.py — Streamlit UI for AutoResearch AI.
 
-Provides two tabs:
-    Research       : Single brand URL input → animated 6-step progress → 8-section report.
-    Compare Brands : Up to 3 URLs researched sequentially, reports shown side by side.
+Three tabs:
 
-Live UI updates are driven by LangGraph's stream() output — no polling, no sleep().
-All timing is measured with time.time() so durations reflect real network latency.
-HTML is rendered inline via st.markdown(unsafe_allow_html=True) because Streamlit
-has no native progress timeline component. All HTML strings are produced by pure
-functions (_header_html, _timeline_html, etc.) for testability.
+    Research          : Single brand URL → animated 6-step progress → 8-section
+                        competitor intelligence report.
+
+    Compare Brands    : Up to 3 URLs researched in PARALLEL using Python threading.
+                        Total time = slowest single brand, not sum of all.
+                        Includes cross-brand LLM summary after all brands complete.
+
+    Ad Creative       : Paste any landing page URL → deep creative extraction →
+    Analyzer            7-section creative intelligence report + 5-dimension scorecard.
+
+Live UI updates are driven by LangGraph stream() events (Research / Creative tabs)
+and a 0.5s polling loop over a shared status dict (Compare tab).
+All HTML strings are produced by pure renderer functions for testability.
 """
 
+import os
 import re
 import time
+import threading
 from datetime import datetime
 import streamlit as st
 from dotenv import load_dotenv
-from agent import build_graph, make_initial_state
 
-load_dotenv()
+# ── Secret injection (must happen BEFORE any downstream imports) ─────────────
+# Locally   : load_dotenv() in each module reads .env — works as before.
+# Cloud     : Streamlit Cloud has no .env file. Secrets live in the app's
+#             Secrets panel and are accessed via st.secrets. We push them into
+#             os.environ here so every subsequent os.getenv() call in chains.py,
+#             tools.py, and memory.py finds the right value.
+# Rule      : never overwrite a value that dotenv or the host already set.
+load_dotenv()  # no-op on Cloud; populates env on local dev
+_SECRETS = [
+    "GROQ_API_KEY", "TAVILY_API_KEY",
+    "LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2", "LANGCHAIN_PROJECT",
+    "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL",
+]
+for _k in _SECRETS:
+    if not os.environ.get(_k):
+        try:
+            os.environ[_k] = str(st.secrets[_k])
+        except (KeyError, Exception):
+            pass  # secret not configured — downstream code degrades gracefully
+
+from langchain_core.messages import HumanMessage
+from agent import build_graph, make_initial_state, build_creative_graph, make_creative_state
+from chains import llm, langfuse_handler
 
 st.set_page_config(page_title="AutoResearch AI", page_icon="🔍", layout="wide")
 
@@ -81,11 +110,11 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
-tab1, tab2 = st.tabs(["🔍 Research", "⚔️ Compare Brands"])
+tab1, tab2, tab3 = st.tabs(["🔍 Research", "⚔️ Compare Brands", "🔍 Creative Decoder"])
 
 
 # ═══════════════════════════════════════════════════════════════
-# HTML RENDERERS — all return strings, rendered via markdown()
+# HTML RENDERERS — Tab 1 (single brand)
 # ═══════════════════════════════════════════════════════════════
 
 def _header_html(label: str, pct: int, elapsed: float) -> str:
@@ -214,6 +243,237 @@ def _stats_html(stats: dict) -> str:
 </div>"""
 
 
+# ═══════════════════════════════════════════════════════════════
+# NODE DEFINITIONS — Tab 3 (creative analyzer)
+# ═══════════════════════════════════════════════════════════════
+CREATIVE_NODE_ORDER = [
+    "scrape_creative",
+    "analyse_creative",
+    "score_creative",
+    "verdict_creative",
+    "store_creative_memory",
+]
+CREATIVE_NODE_LABELS = {
+    "scrape_creative":       "Scraping Creative Elements",
+    "analyse_creative":      "Analysing Creative Strategy",
+    "score_creative":        "Scoring Creative",
+    "verdict_creative":      "Writing Verdict",
+    "store_creative_memory": "Saving to Memory",
+}
+
+INDUSTRIES = [
+    "AI Marketing",
+    "SaaS / Productivity",
+    "E-commerce",
+    "Fintech",
+    "Healthcare",
+    "EdTech",
+    "Developer Tools",
+    "Other",
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+# HTML RENDERERS — Tab 3 (creative analyzer)
+# ═══════════════════════════════════════════════════════════════
+
+def _confidence_html(result: dict) -> str:
+    """
+    Render a small data-quality indicator beneath the scorecard.
+
+    Three states:
+      ⚠️  word_count < 200 — JS-rendered, Tavily fallback used
+      ✅  word_count ≥ 200, single page
+      ✅  multi-page (always positive regardless of word count)
+    """
+    word_count   = result.get("word_count", 0)
+    pages        = result.get("pages_scraped", [])
+    used_tavily  = result.get("used_tavily_fallback", False)
+    pages_label  = " · ".join(pages) if pages else "homepage"
+    n_pages      = len(pages)
+
+    if used_tavily:
+        icon  = "⚠️"
+        color = C_ORANGE
+        msg   = f"JS-rendered site — Tavily fallback used · {word_count} words"
+    elif n_pages >= 2:
+        icon  = "✅"
+        color = C_GREEN
+        msg   = f"{n_pages} pages analysed — {word_count} words"
+    else:
+        icon  = "✅" if word_count >= 300 else "⚠️"
+        color = C_GREEN if word_count >= 300 else C_ORANGE
+        msg   = f"Single page · {word_count} words" + (" — consider pasting the /pricing URL for richer analysis" if word_count < 300 else "")
+
+    return f"""
+<div style="display:flex; align-items:center; gap:10px; padding:8px 14px; background:{C_BG}; border:1px solid {color}44; border-radius:6px; margin:4px 0;">
+  <span style="font-size:14px;">{icon}</span>
+  <span style="color:{C_GRAY}; font-size:12px;">
+    <b style="color:{color};">Pages analysed:</b> {pages_label}
+    &nbsp;·&nbsp; {msg}
+  </span>
+</div>"""
+
+
+def _verdict_html(verdict: str) -> str:
+    """Render the one-sentence verdict in a highlighted box above the scorecard."""
+    return f"""
+<div style="background:linear-gradient(135deg,#1a1040,{C_BG}); border:1px solid {C_PURPLE}88; border-radius:10px; padding:16px 20px; margin:8px 0;">
+  <div style="font-size:11px; font-weight:700; color:{C_PURPLE}; text-transform:uppercase; letter-spacing:1.5px; margin-bottom:8px;">⚡ Verdict</div>
+  <div style="font-size:15px; color:#e2e8f0; font-style:italic; line-height:1.6;">"{verdict}"</div>
+</div>"""
+
+
+def _scorecard_html(scores: dict) -> str:
+    """
+    Render the 5-dimension creative scorecard as horizontal progress bars
+    with a one-line evidence reason shown below each bar.
+
+    Color coding: green ≥7, orange ≥5, red <5.
+    Reasons come from LLM-populated *_reason keys in the scores dict.
+    """
+    items = [
+        ("Clarity of Value Prop",  scores.get("clarity", 0),          scores.get("clarity_reason", "")),
+        ("Emotional Impact",       scores.get("emotional_impact", 0),  scores.get("emotional_impact_reason", "")),
+        ("CTA Effectiveness",      scores.get("cta_effectiveness", 0), scores.get("cta_effectiveness_reason", "")),
+        ("Trust Signals",          scores.get("trust_signals", 0),     scores.get("trust_signals_reason", "")),
+        ("Overall Creative Score", scores.get("overall", 0),           ""),
+    ]
+    rows = ""
+    for label, raw_score, reason in items:
+        score  = max(0.0, min(10.0, float(raw_score) if raw_score else 0))
+        pct    = score / 10 * 100
+        color  = C_GREEN if score >= 7 else C_ORANGE if score >= 5 else C_RED
+        reason_row = ""
+        if reason:
+            reason_row = f'<tr><td colspan="3" style="padding:0 0 6px 0; color:{C_GRAY}; font-size:11px; font-style:italic;">&nbsp;&nbsp;"{reason}"</td></tr>'
+        rows += f"""
+<tr>
+  <td style="color:#e2e8f0; font-size:13px; padding:6px 0 3px 0; width:38%; white-space:nowrap;">{label}</td>
+  <td style="padding:6px 0 3px 14px;">
+    <div style="background:#1e1e2e; border-radius:4px; height:8px; overflow:hidden;">
+      <div style="width:{pct:.1f}%; background:{color}; height:100%; border-radius:4px;"></div>
+    </div>
+  </td>
+  <td style="color:{color}; font-size:13px; font-weight:700; text-align:right; padding:6px 0 3px 10px; white-space:nowrap;">{score:.1f}/10</td>
+</tr>{reason_row}"""
+
+    return f"""
+<div style="background:{C_BG}; border:1px solid {C_PURPLE}55; border-radius:12px; padding:20px 24px; margin:8px 0;">
+  <div style="font-size:16px; font-weight:700; color:{C_PURPLE}; margin-bottom:14px;">🎯 Creative Scorecard</div>
+  <table style="width:100%; border-collapse:collapse;">{rows}</table>
+</div>"""
+
+
+# ═══════════════════════════════════════════════════════════════
+# HTML RENDERERS — Tab 2 (parallel compare)
+# ═══════════════════════════════════════════════════════════════
+
+def _url_label(url: str) -> str:
+    """Short display name from URL before the brand name is known."""
+    try:
+        from urllib.parse import urlparse
+        netloc = urlparse(url).netloc or url
+        return netloc.lstrip("www.")
+    except Exception:
+        return url
+
+
+def _overall_progress_html(total: int, done: int, elapsed: float) -> str:
+    """Banner showing how many brands have finished and total elapsed time."""
+    pct = int(done / total * 100) if total else 0
+    return f"""
+<div style="background:{C_BG}; border:1px solid {C_PURPLE}66; border-radius:12px; padding:16px 20px; margin:4px 0;">
+  <div style="font-size:16px; font-weight:700; color:{C_PURPLE}; margin-bottom:8px;">
+    🔄 &nbsp;Researching {total} brand{"s" if total > 1 else ""} simultaneously...
+  </div>
+  <div style="background:#1e1e2e; border-radius:6px; height:4px; margin-bottom:8px; overflow:hidden;">
+    <div style="width:{pct}%; background:linear-gradient(90deg,{C_PURPLE},{C_GREEN}); height:100%; border-radius:6px;"></div>
+  </div>
+  <div style="color:{C_GRAY}; font-size:13px;">
+    {done} of {total} complete &nbsp;·&nbsp; ⏱️ {elapsed:.0f}s elapsed
+  </div>
+</div>"""
+
+
+def _all_done_html(total: int, elapsed: float) -> str:
+    """Green banner shown once every brand thread has finished."""
+    return f"""
+<div style="background:linear-gradient(135deg,#0d2318,{C_BG}); border:2px solid {C_GREEN}; border-radius:12px; padding:20px 24px; text-align:center; margin:4px 0;">
+  <div style="font-size:36px; margin-bottom:4px;">✅</div>
+  <div style="font-size:16px; font-weight:700; color:{C_GREEN}; margin-bottom:4px;">
+    All {total} brands researched in {elapsed:.0f}s
+  </div>
+  <div style="color:{C_GRAY}; font-size:13px;">
+    Parallel execution — {total}× faster than sequential research
+  </div>
+</div>"""
+
+
+def _compare_col_html(status: dict, url: str) -> str:
+    """
+    Compact per-column progress card for one brand during parallel research.
+
+    Shows the 6-node timeline with live ✅/🔄/⏳ indicators.
+    Error state renders a red card instead of the timeline.
+    """
+    if not status:
+        label = _url_label(url)
+        return f"""
+<div style="background:{C_BG}; border:1px solid {C_BORDER}; border-radius:8px; padding:12px 14px;">
+  <div style="font-size:13px; font-weight:600; color:{C_GRAY};">{label}</div>
+  <div style="color:{C_GRAY}; font-size:12px; margin-top:8px;">⏳ Waiting to start...</div>
+</div>"""
+
+    error = status.get("error")
+    if error:
+        label = _url_label(url)
+        return f"""
+<div style="background:#1a0808; border:1px solid {C_RED}55; border-radius:8px; padding:12px 14px;">
+  <div style="font-size:13px; font-weight:600; color:{C_RED};">⚠️ {label}</div>
+  <div style="color:{C_GRAY}; font-size:12px; margin-top:6px;">{error[:120]}</div>
+</div>"""
+
+    completed  = status.get("completed", {})
+    active     = status.get("active", "")
+    done       = status.get("done", False)
+    brand_name = status.get("state", {}).get("brand_name", "") or _url_label(url)
+    elapsed    = time.time() - status.get("start_time", time.time())
+    iters      = status.get("state", {}).get("iterations", 0)
+
+    rows = []
+    for node in NODE_ORDER:
+        label = NODE_LABELS[node]
+        if node in completed:
+            dur = f"{completed[node]:.1f}s"
+            rows.append(
+                f'<div style="color:{C_GREEN}; font-size:12px; padding:2px 0;">'
+                f'✅ <b>{label}</b> <span style="color:{C_GRAY}; font-size:11px;">{dur}</span></div>'
+            )
+        elif node == active:
+            rows.append(
+                f'<div style="color:{C_PURPLE}; font-size:12px; padding:2px 0;">🔄 <b>{label}...</b></div>'
+            )
+        else:
+            rows.append(
+                f'<div style="color:{C_GRAY}; font-size:12px; padding:2px 0;">⏳ {label}</div>'
+            )
+
+    border_color = C_GREEN if done else C_PURPLE
+    status_text  = f"✅ Done · {elapsed:.0f}s" if done else f"🔄 Running · {elapsed:.0f}s"
+    iter_badge   = ""
+    if iters > 1:
+        iter_badge = f'<div style="margin-top:6px; padding:3px 8px; background:{C_ORANGE}22; border-left:2px solid {C_ORANGE}; color:{C_ORANGE}; font-size:11px; border-radius:0 3px 3px 0;">🔁 Iter {iters}/3</div>'
+
+    return f"""
+<div style="background:{C_BG}; border:1px solid {border_color}55; border-radius:8px; padding:12px 14px;">
+  <div style="font-size:13px; font-weight:700; color:#e2e8f0; margin-bottom:4px;">{brand_name}</div>
+  <div style="color:{C_GRAY}; font-size:11px; margin-bottom:8px;">{status_text}</div>
+  {"".join(rows)}
+  {iter_badge}
+</div>"""
+
+
 # ─────────────────────────────────────────────
 # BRAND CARD RENDERER
 # ─────────────────────────────────────────────
@@ -246,10 +506,12 @@ def _render_brand_card(container, state: dict):
 
 
 # ─────────────────────────────────────────────
-# AGENT RUNNER — streams LangGraph, updates all UI containers in real time
+# AGENT RUNNER (Tab 1) — streams LangGraph, updates UI containers in real time
 # ─────────────────────────────────────────────
 def run_agent(brand_url: str, containers: dict, sidebar_stats) -> dict | None:
     """
+    Run the full research graph for one brand, updating live UI containers at each node.
+
     containers keys: header, timeline, activity, brand_card
     sidebar_stats   : st.empty() in sidebar for live stats
     """
@@ -258,10 +520,10 @@ def run_agent(brand_url: str, containers: dict, sidebar_stats) -> dict | None:
 
     start_time    = time.time()
     last_node_end = start_time
-    completed     = {}         # node_name → duration (seconds)
+    completed     = {}
     active_node   = NODE_ORDER[0]
-    activity_log  = []         # [(hh:mm:ss, message), ...]
-    seen_msgs     = set()      # deduplicate activity feed
+    activity_log  = []
+    seen_msgs     = set()
     stats = {
         "urls_searched": 0,
         "pages_scraped": 0,
@@ -275,7 +537,6 @@ def run_agent(brand_url: str, containers: dict, sidebar_stats) -> dict | None:
         pct     = min(int(len(completed) / len(NODE_ORDER) * 100), 95)
         iters   = state.get("iterations", 0)
 
-        # Collect new status log entries
         for msg in state.get("status_log", []):
             if msg not in seen_msgs:
                 seen_msgs.add(msg)
@@ -295,7 +556,6 @@ def run_agent(brand_url: str, containers: dict, sidebar_stats) -> dict | None:
             containers["activity"].markdown(_activity_html(activity_log), unsafe_allow_html=True)
         sidebar_stats.markdown(_stats_html(stats), unsafe_allow_html=True)
 
-    # Initial render
     containers["header"].markdown(_header_html("Starting...", 0, 0), unsafe_allow_html=True)
     containers["timeline"].markdown(_timeline_html({}, active_node, 0), unsafe_allow_html=True)
 
@@ -306,29 +566,24 @@ def run_agent(brand_url: str, containers: dict, sidebar_stats) -> dict | None:
             state     = list(step.values())[0]
             now       = time.time()
 
-            # Record node duration
             completed[node_name] = now - last_node_end
             last_node_end = now
 
-            # Advance active pointer
             try:
                 idx = NODE_ORDER.index(node_name)
                 active_node = NODE_ORDER[idx + 1] if idx + 1 < len(NODE_ORDER) else ""
             except ValueError:
                 active_node = ""
 
-            # Count LLM calls
             if node_name in ("identify_brand", "check_sufficiency", "generate_report"):
                 stats["llm_calls"] += 1
 
-            # Brand card — appears immediately after brand identification
             if node_name == "identify_brand" and state.get("brand_name"):
                 _render_brand_card(containers["brand_card"], state)
 
             _refresh(state, active_node)
             result = state
 
-        # Completion banner
         total = time.time() - start_time
         stats["elapsed"] = total
         containers["header"].markdown(
@@ -349,7 +604,7 @@ def run_agent(brand_url: str, containers: dict, sidebar_stats) -> dict | None:
 
 
 # ─────────────────────────────────────────────
-# REPORT RENDERER
+# REPORT RENDERER (Tab 1)
 # ─────────────────────────────────────────────
 def display_report(result: dict, brand_name: str):
     if not result or not result.get("final_report"):
@@ -413,6 +668,301 @@ def display_report(result: dict, brand_name: str):
             st.divider()
 
 
+# ─────────────────────────────────────────────
+# PARALLEL RESEARCH HELPERS (Tab 2)
+# ─────────────────────────────────────────────
+
+def _research_brand_silent(url: str, idx: int, brand_status: dict) -> None:
+    """
+    Run the full LangGraph research pipeline for one brand in a background thread.
+
+    Writes progress into brand_status[idx] at every node completion so the
+    main thread can poll and update the UI independently. Never touches
+    Streamlit — all st.* calls must happen on the main thread only.
+    """
+    try:
+        graph   = build_graph()
+        initial = make_initial_state(url.strip())
+        result  = None
+
+        for step in graph.stream(initial):
+            node_name = list(step.keys())[0]
+            state     = list(step.values())[0]
+            now       = time.time()
+
+            brand_status[idx]["completed"][node_name] = now - brand_status[idx]["last_node_end"]
+            brand_status[idx]["last_node_end"] = now
+
+            try:
+                node_idx = NODE_ORDER.index(node_name)
+                brand_status[idx]["active"] = (
+                    NODE_ORDER[node_idx + 1] if node_idx + 1 < len(NODE_ORDER) else ""
+                )
+            except ValueError:
+                brand_status[idx]["active"] = ""
+
+            brand_status[idx]["state"] = state
+            result = state
+
+        brand_status[idx]["result"] = result
+        brand_status[idx]["done"]   = True
+
+    except Exception as e:
+        brand_status[idx]["error"]  = str(e)
+        brand_status[idx]["done"]   = True
+        brand_status[idx]["result"] = None
+
+
+def _generate_cross_brand_summary(results: list) -> str:
+    """
+    Single LLM call that reads all completed reports and produces cross-brand insights.
+
+    This is the unique feature of the Compare tab — no single-brand tool shows
+    common competitor overlap, shared vulnerabilities, or a head-to-head verdict.
+    """
+    names   = [r.get("brand_name", "Brand") for r in results]
+    context = ""
+    for r in results:
+        context += f"\n\n### {r.get('brand_name')} — {r.get('brand_industry', '')}\n"
+        context += r.get("final_report", "")[:2500]
+
+    prompt = f"""You are a cross-brand marketing analyst. You have read full competitor intelligence reports for: {', '.join(names)}.
+
+Reports (truncated):
+{context[:7500]}
+
+Write a concise Cross-Brand Intelligence Summary with exactly these four sections:
+
+**Common competitor themes:** Which competitors appear across multiple brands? What does that reveal about the market structure?
+
+**Shared vulnerabilities:** What weaknesses or threats do all these brands have in common?
+
+**The biggest market gap:** One major opportunity that none of them are fully capturing right now.
+
+**Head-to-head verdict:** Which brand has the strongest competitive position and why? Be direct and specific.
+
+3-5 sentences per section. Reference actual brand names. No filler."""
+
+    try:
+        response = llm.invoke(
+            [HumanMessage(content=prompt)],
+            config={"callbacks": [langfuse_handler], "run_name": "cross_brand_summary"},
+        )
+        return response.content
+    except Exception as e:
+        return f"*Could not generate cross-brand summary: {e}*"
+
+
+# ─────────────────────────────────────────────
+# CREATIVE AGENT RUNNER (Tab 3)
+# ─────────────────────────────────────────────
+def run_creative_agent(url: str, industry: str, containers: dict, sidebar_stats) -> dict | None:
+    """
+    Stream the creative analysis graph and update UI containers at each node completion.
+
+    Reuses the same _header_html / _timeline_html / _activity_html renderers as Tab 1
+    but driven by CREATIVE_NODE_ORDER instead of NODE_ORDER.
+
+    containers keys: header, timeline, activity
+    """
+    graph   = build_creative_graph()
+    initial = make_creative_state(url.strip(), industry)
+
+    start_time    = time.time()
+    last_node_end = start_time
+    completed     = {}
+    active_node   = CREATIVE_NODE_ORDER[0]
+    activity_log  = []
+    seen_msgs     = set()
+    stats = {"urls_searched": 0, "pages_scraped": 1, "iterations": 1,
+             "llm_calls": 0, "elapsed": 0}
+
+    def _refresh(state: dict, active: str):
+        elapsed = time.time() - start_time
+        pct     = min(int(len(completed) / len(CREATIVE_NODE_ORDER) * 100), 95)
+
+        for msg in state.get("status_log", []):
+            if msg not in seen_msgs:
+                seen_msgs.add(msg)
+                activity_log.append((datetime.now().strftime("%H:%M:%S"), msg))
+
+        stats["elapsed"]   = elapsed
+        stats["llm_calls"] = sum(1 for n in completed if n in ("analyse_creative", "score_creative"))
+
+        label = CREATIVE_NODE_LABELS.get(active, active) if active else "Finishing..."
+        # Render timeline using a CREATIVE_NODE_ORDER-aware version
+        containers["header"].markdown(
+            _header_html(label, pct, elapsed), unsafe_allow_html=True
+        )
+        containers["timeline"].markdown(
+            _creative_timeline_html(completed, active), unsafe_allow_html=True
+        )
+        if activity_log:
+            containers["activity"].markdown(
+                _activity_html(activity_log), unsafe_allow_html=True
+            )
+        sidebar_stats.markdown(_stats_html(stats), unsafe_allow_html=True)
+
+    containers["header"].markdown(_header_html("Starting...", 0, 0), unsafe_allow_html=True)
+    containers["timeline"].markdown(
+        _creative_timeline_html({}, active_node), unsafe_allow_html=True
+    )
+
+    result = None
+    try:
+        for step in graph.stream(initial):
+            node_name = list(step.keys())[0]
+            state     = list(step.values())[0]
+            now       = time.time()
+
+            completed[node_name] = now - last_node_end
+            last_node_end = now
+
+            try:
+                idx = CREATIVE_NODE_ORDER.index(node_name)
+                active_node = CREATIVE_NODE_ORDER[idx + 1] if idx + 1 < len(CREATIVE_NODE_ORDER) else ""
+            except ValueError:
+                active_node = ""
+
+            _refresh(state, active_node)
+            result = state
+
+        total          = time.time() - start_time
+        stats["elapsed"] = total
+        containers["header"].markdown(
+            _completion_html(url, total, {"search_results": [], "scraped_content": [{"url": url}],
+                                          "iterations": 1}),
+            unsafe_allow_html=True,
+        )
+        containers["timeline"].markdown(
+            _creative_timeline_html(completed, ""), unsafe_allow_html=True
+        )
+        sidebar_stats.markdown(_stats_html(stats), unsafe_allow_html=True)
+
+    except Exception as e:
+        st.error(f"Error analysing '{url}': {e}")
+        st.exception(e)
+
+    return result
+
+
+def _creative_timeline_html(completed: dict, active: str) -> str:
+    """
+    Render the 4-node creative analysis step tracker.
+
+    Same visual design as _timeline_html but driven by CREATIVE_NODE_ORDER.
+    """
+    rows = []
+    for node in CREATIVE_NODE_ORDER:
+        label = CREATIVE_NODE_LABELS[node]
+        if node in completed:
+            dur = f"{completed[node]:.1f}s"
+            rows.append(f"""
+<tr>
+  <td style="color:{C_GREEN}; padding:5px 0; font-size:14px;">✅ &nbsp;<b>{label}</b></td>
+  <td style="color:{C_GRAY}; text-align:right; font-size:12px; white-space:nowrap;">{dur}</td>
+</tr>""")
+        elif node == active:
+            rows.append(f"""
+<tr>
+  <td style="color:{C_PURPLE}; padding:5px 0; font-size:14px;">🔄 &nbsp;<b>{label}...</b></td>
+  <td style="color:{C_GRAY}; text-align:right; font-size:12px;">running</td>
+</tr>""")
+        else:
+            rows.append(f"""
+<tr>
+  <td style="color:{C_GRAY}; padding:5px 0; font-size:14px;">⏳ &nbsp;{label}</td>
+  <td></td>
+</tr>""")
+
+    return f"""
+<div style="background:{C_BG}; border:1px solid {C_BORDER}; border-radius:8px; padding:12px 16px; margin:4px 0;">
+  <table style="width:100%; border-collapse:collapse;">
+    {"".join(rows)}
+  </table>
+</div>"""
+
+
+def display_creative_report(result: dict):
+    """Render the full creative analysis: verdict + scorecard + raw extractions + 7-section report."""
+    if not result or not result.get("creative_report"):
+        st.error("No creative analysis generated.")
+        return
+
+    # ── Verdict (one sentence above scorecard) ──
+    verdict = result.get("creative_verdict", "")
+    if verdict:
+        st.markdown(_verdict_html(verdict), unsafe_allow_html=True)
+
+    # ── Data confidence indicator ──
+    st.markdown(_confidence_html(result), unsafe_allow_html=True)
+
+    # ── Scorecard with per-dimension reasons ──
+    scores = result.get("creative_scores", {})
+    if scores:
+        st.markdown(_scorecard_html(scores), unsafe_allow_html=True)
+    else:
+        st.warning("Scores not available.")
+
+    st.divider()
+
+    # ── Raw extractions in sidebar-style expander ──
+    with st.expander("📦 Raw Extracted Elements", expanded=False):
+        col_h, col_c, col_p = st.columns(3)
+        with col_h:
+            st.markdown("**Marketing Headlines**")
+            for h in result.get("headlines", []):
+                st.markdown(f"- {h}")
+            plan_names = result.get("plan_names", [])
+            if plan_names:
+                st.markdown("**Pricing Plan Names** *(filtered from headlines)*")
+                for p in plan_names:
+                    st.markdown(f"- {p}")
+        with col_c:
+            st.markdown("**CTAs**")
+            for c in result.get("ctas", []):
+                st.markdown(f"- {c}")
+        with col_p:
+            st.markdown("**Price Mentions**")
+            prices = result.get("price_mentions", [])
+            if prices:
+                for p in prices:
+                    st.markdown(f"- {p}")
+            else:
+                st.caption("None found")
+            st.markdown(f"**Word count:** {result.get('word_count', 0):,}")
+
+    st.divider()
+
+    # ── 7-section report ──
+    CREATIVE_SECTIONS = [
+        ("1.", "🧠 Creative Strategy Overview"),
+        ("2.", "📰 Headline Analysis"),
+        ("3.", "🎯 CTA Analysis"),
+        ("4.", "🗣️ Tone & Messaging"),
+        ("5.", "💰 Pricing Strategy"),
+        ("6.", "⚠️ Weaknesses & Gaps"),
+        ("7.", "🏆 How to Beat Them"),
+    ]
+
+    report = result["creative_report"]
+    parts  = re.split(r'\n##\s+', "\n" + report)
+    section_map: dict = {}
+    for part in parts[1:]:
+        for num, _ in CREATIVE_SECTIONS:
+            if part.strip().startswith(num):
+                section_map[num] = part.strip()
+                break
+
+    for i, (num, label) in enumerate(CREATIVE_SECTIONS):
+        content = section_map.get(num, "")
+        with st.expander(label, expanded=(i == 0)):
+            if content:
+                st.markdown("\n".join(content.split("\n")[1:]).strip())
+            else:
+                st.markdown("*Section not found in report.*")
+
+
 # ═══════════════════════════════════════════════
 # TAB 1 — SINGLE BRAND RESEARCH
 # ═══════════════════════════════════════════════
@@ -424,7 +974,7 @@ with tab1:
     with col1:
         url_input = st.text_input(
             "Brand URL",
-            placeholder="e.g. https://notion.so",
+            placeholder="https://...",
             key="single_url",
         )
     with col2:
@@ -437,9 +987,8 @@ with tab1:
         if not raw:
             st.warning("Please enter a brand URL.")
         elif " " in raw or ("." not in raw and not raw.startswith(("http://", "https://"))):
-            st.error("Please enter a URL (e.g. https://notion.so), not just a brand name.")
+            st.error("Please enter a URL (e.g. https://brandname.com), not just a brand name.")
         else:
-            # Create all live update containers
             header_box   = st.empty()
             timeline_box = st.empty()
             activity_box = st.empty()
@@ -456,7 +1005,7 @@ with tab1:
                 sidebar_stats=sidebar_stats_box,
             )
 
-            # Clear streaming brand card — display_report renders it permanently
+            # Clear streaming brand card — display_report renders it permanently below
             brand_card.empty()
 
             if result:
@@ -464,66 +1013,274 @@ with tab1:
 
 
 # ═══════════════════════════════════════════════
-# TAB 2 — COMPARE BRANDS
+# TAB 2 — COMPARE BRANDS (PARALLEL)
 # ═══════════════════════════════════════════════
 with tab2:
     st.header("Compare Up to 3 Brands Side by Side")
-    st.caption("Paste each brand's URL — the agent extracts names and researches each independently.")
+    st.caption("All brands are researched simultaneously — total time equals the slowest single brand, not the sum.")
 
     c1, c2, c3 = st.columns(3)
-    with c1: url_a = st.text_input("Brand 1 URL", placeholder="e.g. https://notion.so",   key="brand_a")
-    with c2: url_b = st.text_input("Brand 2 URL", placeholder="e.g. https://linear.app",  key="brand_b")
-    with c3: url_c = st.text_input("Brand 3 URL (optional)", placeholder="e.g. https://coda.io", key="brand_c")
+    with c1: url_a = st.text_input("Brand 1 URL", placeholder="https://...", key="brand_a")
+    with c2: url_b = st.text_input("Brand 2 URL", placeholder="https://...", key="brand_b")
+    with c3: url_c = st.text_input("Brand 3 URL (optional)", placeholder="https://... (optional)", key="brand_c")
 
-    compare_btn = st.button("Compare Brands", type="primary", key="compare")
+    btn_col1, btn_col2 = st.columns([3, 1])
+    with btn_col1:
+        compare_btn = st.button("Compare Brands", type="primary", key="compare", use_container_width=True)
+    with btn_col2:
+        reset_btn = st.button("Reset", key="reset_compare", use_container_width=True)
+
+    if reset_btn:
+        st.rerun()
 
     if compare_btn:
         urls    = [u.strip() for u in [url_a, url_b, url_c] if u.strip()]
         invalid = [u for u in urls if " " in u or ("." not in u and not u.startswith(("http://", "https://")))]
+
         if invalid:
             st.error(f"Please enter URLs, not brand names: {', '.join(invalid)}")
         elif len(urls) < 2:
             st.warning("Please enter at least 2 brand URLs to compare.")
         else:
-            results = {}
-            for url in urls:
-                st.subheader(f"Researching: {url}")
-                c_header   = st.empty()
-                c_timeline = st.empty()
-                c_activity = st.empty()
-                c_brand    = st.empty()
-                c_stats    = st.empty()   # per-brand stats (not sidebar)
-                res = run_agent(
-                    url,
-                    containers={
-                        "header":     c_header,
-                        "timeline":   c_timeline,
-                        "activity":   c_activity,
-                        "brand_card": c_brand,
-                    },
-                    sidebar_stats=sidebar_stats_box,
-                )
-                # Collapse progress after each brand
-                c_header.empty()
-                c_timeline.empty()
-                c_activity.empty()
-                c_brand.empty()
-                if res:
-                    results[res.get("brand_name", url)] = res
-                st.divider()
+            n = len(urls)
 
-            if results:
-                st.subheader("Comparison Results")
-                cols = st.columns(len(results))
-                for col, (brand, res) in zip(cols, results.items()):
+            # Initialise shared status dicts BEFORE starting threads
+            # so the polling loop can safely read from them immediately.
+            brand_status: dict = {}
+            for i in range(n):
+                brand_status[i] = {
+                    "completed":    {},
+                    "active":       NODE_ORDER[0],
+                    "state":        {},
+                    "done":         False,
+                    "error":        None,
+                    "result":       None,
+                    "start_time":   time.time(),
+                    "last_node_end": time.time(),
+                }
+
+            compare_start = time.time()
+
+            # Overall progress banner + per-brand column placeholders
+            overall_box   = st.empty()
+            st.divider()
+            progress_cols = st.columns(n)
+            col_containers = [col.empty() for col in progress_cols]
+
+            # ── Launch all threads simultaneously ──
+            threads = []
+            for i, url in enumerate(urls):
+                t = threading.Thread(
+                    target=_research_brand_silent,
+                    args=(url, i, brand_status),
+                    daemon=True,
+                )
+                threads.append(t)
+
+            for t in threads:
+                t.start()
+
+            # ── Polling loop — main thread updates UI every 0.5s ──
+            # sleep(0.5) is intentional here: polling interval between UI refreshes.
+            while not all(brand_status[i]["done"] for i in range(n)):
+                elapsed    = time.time() - compare_start
+                done_count = sum(1 for i in range(n) if brand_status[i]["done"])
+                overall_box.markdown(
+                    _overall_progress_html(n, done_count, elapsed),
+                    unsafe_allow_html=True,
+                )
+                for i in range(n):
+                    col_containers[i].markdown(
+                        _compare_col_html(brand_status[i], urls[i]),
+                        unsafe_allow_html=True,
+                    )
+                time.sleep(0.5)
+
+            # Ensure all threads have fully exited
+            for t in threads:
+                t.join()
+
+            # ── Final UI refresh after all done ──
+            total = time.time() - compare_start
+            overall_box.markdown(_all_done_html(n, total), unsafe_allow_html=True)
+            for i in range(n):
+                col_containers[i].markdown(
+                    _compare_col_html(brand_status[i], urls[i]),
+                    unsafe_allow_html=True,
+                )
+
+            # ── Update sidebar with combined totals ──
+            all_results = [brand_status[i]["result"] for i in range(n) if brand_status[i]["result"]]
+            sidebar_stats_box.markdown(_stats_html({
+                "urls_searched": sum(len(r.get("search_results", [])) for r in all_results),
+                "pages_scraped": sum(len(r.get("scraped_content", [])) for r in all_results),
+                "iterations":    sum(r.get("iterations", 0) for r in all_results),
+                "llm_calls":     n * 3,
+                "elapsed":       total,
+            }), unsafe_allow_html=True)
+
+            st.divider()
+
+            # ── Error cards for failed brands ──
+            failed     = [(i, brand_status[i]) for i in range(n) if brand_status[i]["error"]]
+            successful = [(i, brand_status[i]) for i in range(n)
+                          if not brand_status[i]["error"] and brand_status[i]["result"]]
+
+            for i, status in failed:
+                st.error(f"⚠️ Could not research `{urls[i]}` — {status['error']}")
+
+            if not successful:
+                st.error("All brands failed to research. Check that the URLs are reachable.")
+            else:
+                # ── SECTION 1: Brand cards row ──
+                st.subheader("Brand Overview")
+                card_cols = st.columns(len(successful))
+                for col, (i, status) in zip(card_cols, successful):
+                    r = status["result"]
                     with col:
-                        st.markdown(f"### {brand}")
-                        if res.get("has_live_data"):
-                            st.success(f"{len(res.get('search_results', []))} sources")
-                        else:
-                            st.warning("AI estimate")
-                        with st.expander("Full Report", expanded=True):
-                            st.markdown(res["final_report"])
+                        logo = r.get("brand_logo", "")
+                        if logo:
+                            try:
+                                st.image(logo, width=48)
+                            except Exception:
+                                pass
+                        name     = r.get("brand_name", _url_label(urls[i]))
+                        industry = r.get("brand_industry", "")
+                        sources  = len(r.get("search_results", []))
+                        scraped  = len(r.get("scraped_content", []))
+                        iters    = r.get("iterations", 0)
+                        live_tag = "✅ Live data" if r.get("has_live_data") else "⚠️ AI estimate"
+                        st.markdown(f"### {name}")
+                        if industry:
+                            st.caption(industry)
+                        st.markdown(f"{sources} sources · {scraped} pages · {iters} iter(s)  \n{live_tag}")
+
+                # ── SECTION 2: Quick stats comparison table ──
+                st.divider()
+                st.subheader("Quick Stats Comparison")
+                col_names = [brand_status[i]["result"].get("brand_name", _url_label(urls[i])) for i, _ in successful]
+                tbl  = "| Metric | " + " | ".join(col_names) + " |\n"
+                tbl += "|" + "|".join(["---"] * (len(col_names) + 1)) + "|\n"
+                metric_rows = [
+                    ("Sources found",       lambda r: str(len(r.get("search_results", [])))),
+                    ("Pages scraped",       lambda r: str(len(r.get("scraped_content", [])))),
+                    ("Research iterations", lambda r: str(r.get("iterations", 0))),
+                    ("Reddit threads",      lambda r: str(len(r.get("reddit_insights", [])))),
+                    ("News articles",       lambda r: str(len(r.get("news_insights", [])))),
+                    ("Has live data",       lambda r: "✅" if r.get("has_live_data") else "⚠️"),
+                ]
+                for label, fn in metric_rows:
+                    tbl += f"| {label} | " + " | ".join(fn(brand_status[i]["result"]) for i, _ in successful) + " |\n"
+                st.markdown(tbl)
+
+                # ── SECTION 3: Full reports side by side ──
+                st.divider()
+                st.subheader("Full Reports Side by Side")
+                SECTIONS_COMPARE = [
+                    ("1.", "🏆 Top Competitors"),
+                    ("2.", "🔍 Competitor Analysis"),
+                    ("3.", "📊 Scoring"),
+                    ("4.", "🎯 SWOT"),
+                    ("5.", "💬 Reddit Sentiment"),
+                    ("6.", "🚀 Positioning Gaps"),
+                    ("7.", "💡 Key Insights"),
+                    ("8.", "✅ Recommended Actions"),
+                ]
+                report_cols = st.columns(len(successful))
+                for col, (i, status) in zip(report_cols, successful):
+                    r      = status["result"]
+                    brand  = r.get("brand_name", _url_label(urls[i]))
+                    report = r.get("final_report", "")
+                    parts  = re.split(r'\n##\s+', "\n" + report)
+                    section_map: dict = {}
+                    for part in parts[1:]:
+                        for num, _ in SECTIONS_COMPARE:
+                            if part.strip().startswith(num):
+                                section_map[num] = part.strip()
+                                break
+                    with col:
+                        st.markdown(f"#### {brand}")
+                        for j, (num, lbl) in enumerate(SECTIONS_COMPARE):
+                            content = section_map.get(num, "")
+                            with st.expander(lbl, expanded=(j == 0)):
+                                if content:
+                                    st.markdown("\n".join(content.split("\n")[1:]).strip())
+                                else:
+                                    st.markdown("*Section not found.*")
+
+                # ── SECTION 4: Cross-brand intelligence summary ──
+                if len(successful) >= 2:
+                    st.divider()
+                    st.subheader("Cross-Brand Intelligence Summary")
+                    st.caption(
+                        "One LLM call synthesising all reports — common rivals, shared gaps, "
+                        "and a head-to-head verdict no single-brand tool provides."
+                    )
+                    with st.spinner("Generating cross-brand analysis..."):
+                        cross_results = [brand_status[i]["result"] for i, _ in successful]
+                        summary = _generate_cross_brand_summary(cross_results)
+                    st.markdown(summary)
+
+
+# ═══════════════════════════════════════════════
+# TAB 3 — CREATIVE DECODER
+# ═══════════════════════════════════════════════
+with tab3:
+    st.header("Creative Decoder")
+    st.caption(
+        "Paste any competitor URL — agent decodes their full creative strategy "
+        "and tells you exactly how to beat them."
+    )
+
+    cr_col1, cr_col2, cr_col3 = st.columns([4, 2, 1])
+    with cr_col1:
+        creative_url = st.text_input(
+            "Competitor Landing Page URL",
+            placeholder="https://...",
+            key="creative_url",
+        )
+    with cr_col2:
+        creative_industry = st.selectbox(
+            "Your Industry",
+            options=INDUSTRIES,
+            key="creative_industry",
+        )
+    with cr_col3:
+        st.write("")
+        st.write("")
+        creative_btn = st.button("Analyse", type="primary", use_container_width=True, key="run_creative")
+
+    if creative_btn:
+        raw_url = creative_url.strip()
+        if not raw_url:
+            st.warning("Please enter a URL.")
+        elif " " in raw_url or ("." not in raw_url and not raw_url.startswith(("http://", "https://"))):
+            st.error("Please enter a valid URL, not just a brand name.")
+        else:
+            cr_header   = st.empty()
+            cr_timeline = st.empty()
+            cr_activity = st.empty()
+
+            creative_result = run_creative_agent(
+                raw_url,
+                creative_industry,
+                containers={
+                    "header":   cr_header,
+                    "timeline": cr_timeline,
+                    "activity": cr_activity,
+                },
+                sidebar_stats=sidebar_stats_box,
+            )
+
+            if creative_result:
+                st.divider()
+                # Show URL + industry badge above report
+                st.markdown(
+                    f"**Analysed:** `{raw_url}`  &nbsp; | &nbsp;  "
+                    f"**Industry context:** {creative_industry}"
+                )
+                st.divider()
+                display_creative_report(creative_result)
 
 
 # ─────────────────────────────────────────────

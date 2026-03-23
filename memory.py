@@ -1,37 +1,50 @@
 """
 memory.py — Persistent vector memory for AutoResearch AI.
 
-Stores completed research reports in a local Chroma vector database so the
-agent can recall past work across sessions. Uses sentence-transformers for
-embeddings — no external embedding API key required.
+Stores completed research reports and creative analyses in a local Chroma
+vector database so the agent can recall past work across sessions.
+Uses sentence-transformers for embeddings — no external embedding API required.
+
+Collections:
+    research_memory : Competitor intelligence reports (one per brand per run).
+    creative_memory : Ad creative analysis reports (one per URL per run).
 
 Exports:
-    save_research(brand_name, report_text) : Embed and persist a report.
-    retrieve_similar(brand_name, k)        : Retrieve the k most similar past reports.
+    save_research(brand_name, report_text) : Persist a competitor research report.
+    retrieve_similar(brand_name, k)        : Retrieve similar past research reports.
+    save_creative(url, report_text)        : Persist a creative analysis report.
 
-Resilience: all Chroma initialisation is wrapped in a try/except. If Chroma
-is unavailable (e.g. conflicting package versions), both functions degrade
-gracefully — save_research becomes a no-op and retrieve_similar returns [].
-The agent continues to run; only cross-session memory is lost.
+Resilience: all Chroma initialisation is wrapped in a single try/except.
+If Chroma is unavailable, all functions degrade gracefully to no-ops / empty
+returns. The agent continues to run; only cross-session memory is lost.
 """
 
 from datetime import datetime
 
-_vector_store = None
+_vector_store  = None   # research_memory collection
+_creative_store = None  # creative_memory collection
 
 try:
     import chromadb
     from langchain_chroma import Chroma
     from langchain_huggingface import HuggingFaceEmbeddings
 
-    _embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    _embeddings    = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     _chroma_client = chromadb.PersistentClient(path="./chroma_db")
+
     _vector_store = Chroma(
         client=_chroma_client,
         collection_name="research_memory",
         embedding_function=_embeddings,
     )
-    print("[memory] Chroma initialized successfully.")
+    # Separate collection keeps creative analyses searchable independently
+    # from competitor research — different query patterns, different recall use cases.
+    _creative_store = Chroma(
+        client=_chroma_client,
+        collection_name="creative_memory",
+        embedding_function=_embeddings,
+    )
+    print("[memory] Chroma initialized successfully (research_memory + creative_memory).")
 except Exception as _e:
     print(f"[memory] Chroma unavailable — memory disabled. ({_e})")
 
@@ -72,4 +85,25 @@ def retrieve_similar(brand_name: str, k: int = 3) -> list[str]:
     except Exception as e:
         print(f"[memory] Retrieval error for '{brand_name}': {e}")
         return []
+
+
+def save_creative(url: str, report_text: str) -> None:
+    """
+    Embed and persist a completed creative analysis report to Chroma.
+
+    Uses the creative_memory collection so creative analyses are kept
+    separate from competitor research and can be queried independently.
+    No-op if Chroma failed to initialise at import time.
+    """
+    if _creative_store is None:
+        return
+    # Sanitise URL into a valid Chroma doc ID (no slashes, colons, or dots)
+    safe_id = url.replace("https://", "").replace("http://", "").replace("/", "_").replace(".", "_")
+    doc_id  = f"creative_{safe_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    _creative_store.add_texts(
+        texts=[report_text],
+        metadatas=[{"url": url, "timestamp": datetime.now().isoformat()}],
+        ids=[doc_id],
+    )
+    print(f"[memory] Saved creative analysis for '{url}' as '{doc_id}'")
 
