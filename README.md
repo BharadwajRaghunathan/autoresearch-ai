@@ -1,83 +1,133 @@
 # AutoResearch AI
 
-An autonomous marketing intelligence agent that researches any brand's competitive landscape from a single URL. Paste a brand URL, and the agent scrapes the website, runs parallel web research, evaluates data quality, loops until sufficient, and delivers a structured 8-section competitor report.
+**Autonomous marketing intelligence agent — paste any brand URL, get a full competitor report in under 60 seconds.**
+
+Built with LangGraph, Groq, Tavily, Chroma, LangSmith, and Langfuse. Three features, all powered by real web research — no hallucinated data, no fake placeholders.
 
 ---
 
-## Why This Exists
+## Features
 
-Manual competitor research is slow, inconsistent, and often biased toward whatever shows up on the first page of Google. AutoResearch AI turns that into a repeatable, observable process — every run is traced end-to-end, every LLM prompt is versioned in Langfuse, and every report is stored in a vector database for future recall.
+### 🔍 Brand Research
+Paste one URL → the agent identifies the brand, runs parallel competitor research across the web, Reddit, news, and pricing pages, self-evaluates data quality, loops until sufficient, and generates a structured 8-section intelligence report.
+
+### ⚔️ Compare Brands
+Paste up to 3 URLs → all brands are researched **simultaneously** using Python threading (total time = slowest single brand, not sum of all). Produces side-by-side reports plus a cross-brand LLM summary — shared vulnerabilities, common rivals, and a head-to-head verdict no single-brand tool can produce.
+
+### 🔍 Creative Decoder
+Paste any competitor's landing page → agent deep-scrapes creative elements (headlines, CTAs, pricing, trust signals), auto-discovers `/pricing` and `/features` pages, falls back to Tavily for JS-rendered sites, and produces a 7-section creative intelligence report with a 5-dimension scorecard and one-sentence verdict.
 
 ---
 
 ## How It Works
 
+### Brand Research — LangGraph Flow
+
 ```
-User pastes brand URL
-        │
-        ▼
-┌─────────────────────┐
-│   identify_brand    │  Scrapes the URL, verifies it via LLM,
-│                     │  extracts: industry, description, logo
-└────────┬────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│       search        │  4 parallel Tavily streams:
-│                     │  competitors · Reddit · news · pricing
-└────────┬────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│       scrape        │  BeautifulSoup scrape of every
-│                     │  competitor URL found
-└────────┬────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│  check_sufficiency  │  LLM self-evaluation: YES → proceed
-│                     │  NO + iterations < 3 → loop back
-└────────┬────────────┘
-         │  (loop up to 3×)
-         ▼
-┌─────────────────────┐
-│   generate_report   │  8-section markdown intelligence report
-└────────┬────────────┘
-         │
-         ▼
-┌─────────────────────┐
-│    store_memory     │  Persist to Chroma for future recall
-└─────────────────────┘
+START
+  │
+  ▼
+identify_brand ── Scrapes provided URL, verifies via LLM
+  │               Extracts: industry, description, logo
+  │               Never guesses a URL from a name
+  ▼
+search ────────── 4 parallel Tavily streams:
+  │               competitors · Reddit · news · pricing
+  ▼
+scrape ─────────── BeautifulSoup scrape of every URL found
+  │
+  ▼
+check_sufficiency ─ LLM evaluates data quality
+  │                 YES → proceed  |  NO + iter < 3 → loop
+  ▼
+generate_report ─── 8-section markdown intelligence report
+  │                 brand_industry injected to prevent hallucination
+  ▼
+store_memory ────── Persist to Chroma (research_memory collection)
+  │
+END
+```
+
+### Compare Brands — Parallel Threading
+
+```
+Main thread spawns N background threads simultaneously
+  Thread 0 → full research graph for brand A
+  Thread 1 → full research graph for brand B
+  Thread 2 → full research graph for brand C
+
+Main thread polls brand_status dict every 0.5s
+→ updates 3 live columns in the UI independently
+
+All threads join → render:
+  Brand cards · Stats comparison table
+  Full reports side by side · Cross-brand LLM summary
+```
+
+### Creative Decoder — 5-Node Graph
+
+```
+START
+  │
+  ▼
+scrape_creative ─── BeautifulSoup: headlines, CTAs, prices, alts
+  │                 JS fallback: Tavily if word_count < 200
+  │                 Auto-discovers /pricing + /features (3s timeout)
+  │                 Labels content: [HOMEPAGE] [PRICING] [FEATURES]
+  ▼
+analyse_creative ── LLM Call 1: 7-section qualitative report
+  │                 Industry benchmark injected (SaaS/AI/Fintech/etc)
+  ▼
+score_creative ──── LLM Call 2: JSON scorecard with reasons
+  │                 Evidence-based rules enforced in Python
+  │                 (no trust found → score < 5, hard override)
+  ▼
+verdict_creative ── LLM Call 3: ≤25 word synthesis
+  │                 "strength — weakness + how to exploit it"
+  ▼
+store_creative ──── Persist to Chroma (creative_memory collection)
+  │
+END
 ```
 
 ---
 
-## Report Output
+## Report Outputs
 
-Each run produces a structured 8-section report:
-
-1. **Top Competitors Identified** — 4–6 real competitors with one-line descriptions
-2. **Competitor Analysis** — Positioning, strengths, weaknesses, target audience per competitor
-3. **Competitor Scoring** — Feature · Pricing · Market Presence · Growth scored 1–10
-4. **SWOT Analysis** — Strengths / Weaknesses / Opportunities / Threats for the input brand
-5. **Reddit Sentiment** — What real users say, with direct quotes where available
-6. **Market Positioning Gaps** — Specific opportunities competitors are missing
+### Brand Research — 8 Sections
+1. **Top Competitors Identified** — 4–6 real competitors, one-line descriptions
+2. **Competitor Analysis** — Positioning, strengths, weaknesses, target audience
+3. **Competitor Scoring** — Feature · Pricing · Market Presence · Growth (1–10 table)
+4. **SWOT Analysis** — Strengths / Weaknesses / Opportunities / Threats
+5. **Reddit Sentiment** — Real user opinions, direct quotes where available
+6. **Market Positioning Gaps** — Opportunities competitors are missing
 7. **Key Insights** — 7 bullet-point findings
-8. **Recommended Actions** — 5 actionable steps to win market share
+8. **Recommended Actions** — 5 specific steps to win market share
+
+### Creative Decoder — 7 Sections + Scorecard
+1. **Creative Strategy Overview** — Core message, emotion/pain point targeted
+2. **Headline Analysis** — Each headline with psychological trigger label
+3. **CTA Analysis** — Conversion pressure rated soft / medium / aggressive
+4. **Tone & Messaging** — Voice archetype, repeating words, benefit vs feature focus
+5. **Pricing Strategy** — Presentation, anchoring techniques, freemium signals
+6. **Weaknesses & Gaps** — What's missing vs industry benchmark
+7. **How to Beat Them** — 5 specific "Instead of X, do Y — because Z" recommendations
+
+**Scorecard:** Clarity · Emotional Impact · CTA Effectiveness · Trust Signals · Overall (each with evidence-based reason)
 
 ---
 
 ## Tech Stack
 
-| Layer | Tool |
+| Layer | Technology |
 |---|---|
-| Agent orchestration | LangGraph (StateGraph) |
+| Agent orchestration | LangGraph — StateGraph |
 | LLM | Groq — llama-3.3-70b-versatile |
 | Web search | Tavily Search API |
 | Web scraping | BeautifulSoup + requests |
 | Vector memory | Chroma DB (local, persistent) |
 | Embeddings | sentence-transformers (all-MiniLM-L6-v2) |
-| Prompt management | Langfuse |
+| Prompt management | Langfuse — live editing without redeployment |
 | LLM tracing | LangSmith + Langfuse |
 | UI | Streamlit |
 | LLM framework | LangChain |
@@ -98,7 +148,7 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Fill in your API keys — see Environment Variables below
+# Fill in your API keys
 ```
 
 **3. Run**
@@ -107,24 +157,24 @@ cp .env.example .env
 streamlit run app.py
 ```
 
-Open `http://localhost:8501`, paste any brand URL (e.g. `https://notion.so`), and click **Run Research**.
+Open `http://localhost:8501` and paste any brand URL.
 
 ---
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` and fill in the values:
-
 | Variable | Required | Description |
 |---|---|---|
-| `GROQ_API_KEY` | Yes | Groq API key — [console.groq.com](https://console.groq.com) |
-| `TAVILY_API_KEY` | Yes | Tavily Search API key — [app.tavily.com](https://app.tavily.com) |
-| `LANGCHAIN_API_KEY` | Yes | LangSmith API key — [smith.langchain.com](https://smith.langchain.com) |
-| `LANGCHAIN_TRACING_V2` | Yes | Set to `true` to enable LangSmith tracing |
-| `LANGCHAIN_PROJECT` | Yes | LangSmith project name (e.g. `autoresearch-ai`) |
-| `LANGFUSE_PUBLIC_KEY` | Yes | Langfuse public key — [cloud.langfuse.com](https://cloud.langfuse.com) |
+| `GROQ_API_KEY` | Yes | [console.groq.com](https://console.groq.com) |
+| `TAVILY_API_KEY` | Yes | [app.tavily.com](https://app.tavily.com) |
+| `LANGCHAIN_API_KEY` | Yes | [smith.langchain.com](https://smith.langchain.com) |
+| `LANGCHAIN_TRACING_V2` | Yes | Set to `true` |
+| `LANGCHAIN_PROJECT` | Yes | Your LangSmith project name |
+| `LANGFUSE_PUBLIC_KEY` | Yes | [cloud.langfuse.com](https://cloud.langfuse.com) |
 | `LANGFUSE_SECRET_KEY` | Yes | Langfuse secret key |
-| `LANGFUSE_BASE_URL` | Yes | Langfuse host (default: `https://cloud.langfuse.com`) |
+| `LANGFUSE_BASE_URL` | Yes | `https://cloud.langfuse.com` |
+
+**Streamlit Cloud:** Add all keys in App Settings → Secrets (TOML format). The app reads `st.secrets` automatically before initialising any API clients.
 
 ---
 
@@ -132,63 +182,64 @@ Copy `.env.example` to `.env` and fill in the values:
 
 ```
 autoresearch-ai/
-├── app.py            # Streamlit UI — animated progress, report display
-├── agent.py          # LangGraph state machine — all 6 nodes
-├── chains.py         # Groq LLM setup + Langfuse prompt management
-├── tools.py          # Tavily search + BeautifulSoup scraper
-├── memory.py         # Chroma vector DB — save and retrieve reports
-├── requirements.txt  # Python dependencies
-├── .env.example      # Environment variable template
-└── chroma_db/        # Auto-created — local Chroma database
+├── app.py           # Streamlit UI — 3 tabs, animated progress, HTML renderers
+├── agent.py         # LangGraph graphs — ResearchState + CreativeState
+├── chains.py        # Groq LLM + Langfuse callback + prompt management
+├── tools.py         # Tavily search + BeautifulSoup + creative extractor
+├── memory.py        # Chroma — research_memory + creative_memory collections
+├── requirements.txt
+├── .env.example
+└── chroma_db/       # Auto-created on first run
 ```
 
 ---
 
 ## Observability
 
-Every research run is fully traced across two platforms:
+Every run is fully traced across two platforms.
 
-**LangSmith** — automatic agent traces when `LANGCHAIN_TRACING_V2=true`. Each LangGraph node appears as a span, showing input state, output state, and token usage.
+**LangSmith** — automatic when `LANGCHAIN_TRACING_V2=true`. Each LangGraph node appears as a span with input state, output state, and token usage.
 
-**Langfuse** — secondary trace + live prompt management. Three prompts are managed in Langfuse UI and fetched at runtime:
+**Langfuse** — secondary trace + live prompt management. All 6 prompts are managed in Langfuse UI and fetched at runtime:
 
-| Prompt name | Used in node | Purpose |
+| Prompt name | Node | Purpose |
 |---|---|---|
 | `verify-brand` | identify_brand | Confirm a webpage belongs to the target brand |
-| `check-sufficiency` | check_sufficiency | Decide whether to loop or proceed to report |
-| `generate-report` | generate_report | Produce the 8-section intelligence report |
+| `check-sufficiency` | check_sufficiency | Loop or proceed to report generation |
+| `generate-report` | generate_report | 8-section competitor intelligence report |
+| `analyse-creative` | analyse_creative | 7-section creative strategy analysis |
+| `score-creative` | score_creative | Evidence-based JSON scorecard with reasons |
+| `verdict-creative` | verdict_creative | One-sentence strength + weakness verdict |
 
-Prompts can be edited in the Langfuse UI without redeploying. If a prompt is missing, the agent falls back to the inline version in `agent.py`.
+Edit any prompt in Langfuse UI — the change is live on the next run. If Langfuse is unreachable, every prompt has an inline fallback in `agent.py`.
 
 ---
 
 ## Key Engineering Decisions
 
-**URL-first identity, not brand name guessing**
-The agent never assumes a URL from a brand name. It either scrapes the user-provided URL directly or runs scored Tavily searches and verifies candidates with the LLM. This prevents the "wrong company" problem entirely.
+**URL-first identity** — The agent never guesses a URL from a brand name. It scrapes the provided URL directly, or runs scored Tavily candidate searches and LLM-verifies each result. This eliminates the "wrong company" problem.
 
-**Industry-locked prompts**
-`brand_industry` (e.g. "AI Marketing Technology") is extracted from the real website and injected into every report prompt. The LLM is explicitly instructed not to list competitors outside that industry.
+**Industry-locked prompts** — `brand_industry` is extracted from real HTML and injected into every report prompt. The LLM is explicitly blocked from listing competitors outside that industry.
 
-**Parallel data collection**
-The search node runs four Tavily streams simultaneously using `ThreadPoolExecutor`. Total search time is bounded by the slowest single query, not the sum of all four.
+**Parallel execution everywhere** — Search node: 4 Tavily streams via `ThreadPoolExecutor`. Compare tab: N full research graphs via `threading.Thread`. Total time is bounded by the slowest single operation, not their sum.
 
-**Self-correcting loop**
-After scraping, the LLM evaluates its own data quality. If insufficient, the agent loops back for another search pass — up to three iterations. The cap prevents runaway loops on sparse topics.
+**Evidence-enforced scoring** — The Creative Decoder scores are grounded in extracted data. If no trust signals were found in the HTML, the trust score is hard-capped at 4 in Python — regardless of what the LLM returns.
 
-**Memory resilience**
-Chroma initialisation is wrapped in a try/except at import time. If Chroma fails (e.g. dependency conflict), `save_research` becomes a no-op and the agent continues normally. Only cross-session recall is affected.
+**Self-correcting research loop** — After scraping, the LLM evaluates its own data quality and decides whether to loop. Capped at 3 iterations to prevent runaway loops on sparse topics.
 
-**No fake progress**
-All UI timing comes from `time.time()` at each node completion event from LangGraph's `stream()`. There are no `sleep()` calls or simulated delays.
+**JS-rendered site fallback** — When BeautifulSoup returns fewer than 200 words, the scraper switches to Tavily (which holds pre-rendered page snapshots). Content is labeled by source so the LLM knows what came from where.
+
+**Memory resilience** — Chroma is initialised inside a try/except at import time. A failure makes save/retrieve no-ops — the agent continues normally, only cross-session memory is lost.
+
+**No fake progress** — All UI timing comes from `time.time()` at each LangGraph node completion event. No `sleep()` calls, no simulated progress.
 
 ---
 
 ## Author
 
 **Bharadwaj R**
-- **GitHub**: [@BharadwajRaghunathan](https://github.com/BharadwajRaghunathan)
-- **Email**: bharadwaj.r2112@gmail.com
+- GitHub: [@BharadwajRaghunathan](https://github.com/BharadwajRaghunathan)
+- Email: bharadwaj.r2112@gmail.com
 
 ---
 
