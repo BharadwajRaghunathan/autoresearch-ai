@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(pip freeze:*)",
+      "Bash(python:*)",
+      "Bash(streamlit run:*)"
+    ]
+  }
+}

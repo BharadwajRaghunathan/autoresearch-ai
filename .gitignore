@@ -208,4 +208,4 @@ __marimo__/
 
 # AutoResearch AI — local data
 chroma_db/
-.claude/
+.claude/settings.local.json
