@@ -169,58 +169,71 @@ def _sarvam_client():
     return _sarvam_client_instance
 
 
-def _audio_extension(audio_bytes: bytes) -> str:
+def _detect_audio_mime(audio_bytes: bytes) -> tuple[str, str]:
     """
-    Detect audio format from magic bytes so the temp file gets the correct
-    extension — critical for Sarvam's multipart upload to set the right MIME type.
+    Detect audio format from magic bytes and return (filename, mime_type) to use
+    for the Sarvam multipart upload.
 
-    st.audio_input() returns different formats by browser/OS:
-      Chrome (desktop + Cloud): webm/opus  → .webm
-      Safari / iOS:             mp4/AAC    → .mp4
-      WAV (rare):               RIFF       → .wav
-    Sarvam supports: wav, mp3, ogg, flac, mp4, webm — falls back to .wav.
+    Sarvam supported formats: WAV, MP3, OGG, FLAC, AAC.
+    WebM (Chrome/Streamlit Cloud default) is NOT in the list — mapped to OGG
+    because both use the Opus codec and Sarvam accepts the stream correctly.
+    MP4/AAC (Safari) mapped to AAC.
+
+    Returns: (filename string, MIME type string)
     """
     if audio_bytes[:4] == b"RIFF":
-        return ".wav"
+        return "audio.wav", "audio/wav"
     if audio_bytes[:3] == b"ID3" or audio_bytes[:2] == b"\xff\xfb":
-        return ".mp3"
+        return "audio.mp3", "audio/mpeg"
     if audio_bytes[:4] == b"OggS":
-        return ".ogg"
+        return "audio.ogg", "audio/ogg"
     if audio_bytes[:4] == b"fLaC":
-        return ".flac"
-    if audio_bytes[4:8] in (b"ftyp", b"moov") or audio_bytes[:4] == b"\x00\x00\x00\x18":
-        return ".mp4"
-    # WebM EBML header
+        return "audio.flac", "audio/flac"
+    if audio_bytes[4:8] == b"ftyp" or audio_bytes[:4] == b"\x00\x00\x00\x18":
+        return "audio.aac", "audio/aac"
+    # WebM EBML magic bytes — remap to OGG (same Opus codec, Sarvam accepts it)
     if audio_bytes[:4] == b"\x1a\x45\xdf\xa3":
-        return ".webm"
-    return ".wav"  # safe default
+        return "audio.ogg", "audio/ogg"
+    # Unknown — default to WAV and hope for the best
+    return "audio.wav", "audio/wav"
 
 
 def transcribe_sarvam(audio_bytes: bytes) -> str:
     """
-    Speech-to-text via Sarvam Saaras v3 SDK (latest recommended model).
+    Speech-to-text via Sarvam Saaras v3 REST API.
 
-    Detects the actual audio format from magic bytes before saving to temp file
-    so Sarvam receives the correct MIME type. On Streamlit Cloud, st.audio_input()
-    returns webm/opus (Chrome) not WAV — using .wav extension silently fails.
+    Uses requests directly (not the SDK) so we control the filename and MIME type
+    in the multipart upload. Critical for Streamlit Cloud where st.audio_input()
+    returns webm/opus (Chrome) — we remap it to audio/ogg (same codec, Sarvam accepts it).
 
     Returns transcript string. Returns "" on any failure — never raises.
     """
+    import requests as _requests
+    api_key = os.environ.get("SARVAM_API_KEY", "")
+    if not api_key:
+        print("[sarvam_stt] SARVAM_API_KEY not set.")
+        return ""
+
+    filename, mime = _detect_audio_mime(audio_bytes)
+    print(f"[sarvam_stt] Detected format: {mime} → sending as {filename}")
+
     tmp_path = None
     try:
-        client   = _sarvam_client()
-        ext      = _audio_extension(audio_bytes)
-        print(f"[sarvam_stt] Detected audio format: {ext}")
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+        with tempfile.NamedTemporaryFile(delete=False) as f:
             f.write(audio_bytes)
             tmp_path = f.name
         with open(tmp_path, "rb") as audio_file:
-            response = client.speech_to_text.transcribe(
-                file=audio_file,
-                model="saaras:v3",
-                mode="transcribe",
+            resp = _requests.post(
+                "https://api.sarvam.ai/speech-to-text",
+                headers={"api-subscription-key": api_key},
+                files={"file": (filename, audio_file, mime)},
+                data={"model": "saaras:v3", "mode": "transcribe"},
+                timeout=30,
             )
-        transcript = getattr(response, "transcript", None) or ""
+        if not resp.ok:
+            print(f"[sarvam_stt] API error {resp.status_code}: {resp.text}")
+            return ""
+        transcript = resp.json().get("transcript", "")
         print(f"[sarvam_stt] Transcript: '{transcript}'")
         return transcript
     except Exception as e:
