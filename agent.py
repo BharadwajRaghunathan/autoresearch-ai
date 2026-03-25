@@ -23,9 +23,11 @@ Anti-hallucination design:
     prompt explicitly forbids listing competitors outside that industry.
 
 Exports:
-    build_graph()           : Compile and return the LangGraph app.
+    build_graph()           : Compile and return the LangGraph app (now 7 nodes incl. trend_compare).
     make_initial_state(...) : Construct a zero-value ResearchState dict.
     ResearchState           : TypedDict for the shared state.
+    voice_summary_node(...) : Standalone — condense report for TTS (not in graph).
+    trend_compare_node(...) : Node 6 — diff current vs previous Chroma report.
 """
 
 import json
@@ -38,7 +40,7 @@ from langchain_core.messages import HumanMessage
 
 from chains import llm, langfuse_handler, get_langfuse_prompt
 from tools import scrape_website, search_reddit, search_news, search_pricing, _tavily_search, extract_brand_identity, scrape_creative_page
-from memory import save_research, save_creative
+from memory import save_research, save_creative, get_previous_research
 
 load_dotenv()
 
@@ -84,6 +86,9 @@ class ResearchState(TypedDict):
     status_log: list
     current_node: str
     has_live_data: bool
+    voice_summary: str      # Spoken-style condensed report (≤100 words, no markdown)
+    is_voice_mode: bool     # True when request came from the Voice tab
+    trend_delta: str        # What changed vs last Chroma run for this brand (empty on first run)
 
 
 # ─────────────────────────────────────────────
@@ -651,6 +656,136 @@ def store_memory_node(state: ResearchState) -> ResearchState:
 
 
 # ─────────────────────────────────────────────
+# TREND TRACKER NODE — wired into research graph
+# Runs after generate_report, before store_memory.
+# On first run for a brand: no-op (trend_delta stays "").
+# On subsequent runs: LLM diffs current vs previous report.
+# ─────────────────────────────────────────────
+
+_TREND_COMPARE_FALLBACK = """\
+You are a competitive intelligence analyst comparing two research snapshots for the same brand.
+
+Brand: {{brand}}
+
+PREVIOUS REPORT (last run):
+{{previous}}
+
+CURRENT REPORT (this run):
+{{current}}
+
+Write a concise "What Changed" summary with exactly these three parts:
+
+**New threats:** Any competitors that appeared this run but not last time. If none, say "No new entrants detected."
+
+**Disappeared or weakened:** Any competitors from last run that are no longer prominent. If none, say "No exits detected."
+
+**Shift in market dynamics:** One sentence on the biggest strategic change between the two snapshots.
+
+Be specific — name actual companies. 2-3 sentences per part. No filler.\
+"""
+
+
+def trend_compare_node(state: ResearchState) -> dict:
+    """
+    Compare the freshly generated report against the most recent Chroma entry
+    for the same brand and surface what changed.
+
+    No-op on first run (no previous report in memory). On subsequent runs,
+    produces a plain-language diff the UI renders as a "What Changed" panel.
+    Chroma is queried BEFORE store_memory runs so the result is always the
+    previous run, never the current one.
+    """
+    log_entry = "Comparing with previous research..."
+    print(log_entry)
+
+    previous = get_previous_research(state.get("brand_name", ""))
+    if not previous:
+        print("[trend_compare] No previous report found — first run for this brand.")
+        return {
+            "trend_delta":  "",
+            "current_node": "trend_compare",
+            "status_log":   state.get("status_log", []) + ["No previous data — trend comparison skipped."],
+        }
+
+    prompt = get_langfuse_prompt(
+        "trend-compare",
+        _TREND_COMPARE_FALLBACK,
+        brand=state.get("brand_name", ""),
+        previous=previous[:3000],
+        current=state.get("final_report", "")[:3000],
+    )
+    try:
+        response = llm.invoke(
+            [HumanMessage(content=prompt)],
+            config={"callbacks": [langfuse_handler], "run_name": "trend_compare"},
+        )
+        delta = response.content.strip()
+    except Exception as e:
+        print(f"[trend_compare] LLM error: {e}")
+        delta = ""
+
+    print(f"[trend_compare] Delta generated ({len(delta)} chars)")
+    return {
+        "trend_delta":  delta,
+        "current_node": "trend_compare",
+        "status_log":   state.get("status_log", []) + [log_entry],
+    }
+
+
+# ─────────────────────────────────────────────
+# VOICE SUMMARY — standalone callable (not in graph)
+# Called by app.py after run_agent() when is_voice_mode=True
+# ─────────────────────────────────────────────
+
+_VOICE_SUMMARY_FALLBACK = """\
+You are summarising a competitor intelligence report to be read aloud.
+
+Rules — follow exactly:
+- No markdown, no bullet points, no section headers.
+- Plain spoken sentences only.
+- Under 100 words total.
+- Cover: top 2 competitors found, biggest threat, one market gap, one recommended action.
+
+Report:
+{{report}}
+
+Output only the spoken summary. Nothing else.\
+"""
+
+
+def voice_summary_node(state: ResearchState) -> dict:
+    """
+    Condense the full research report into a short spoken-style paragraph.
+
+    Called directly (not as a graph node) from app.py when is_voice_mode is True.
+    Produces ≤100 words of plain prose with no markdown — safe to pass straight
+    to edge-tts for speech synthesis.
+
+    Returns a partial state dict with voice_summary populated.
+    """
+    report = state.get("final_report", "")
+    if not report:
+        return {"voice_summary": "No report available to summarise."}
+
+    prompt = get_langfuse_prompt(
+        "voice-summary",
+        _VOICE_SUMMARY_FALLBACK,
+        report=report[:4000],
+    )
+    try:
+        response = llm.invoke(
+            [HumanMessage(content=prompt)],
+            config={"callbacks": [langfuse_handler], "run_name": "voice_summary"},
+        )
+        summary = response.content.strip()
+    except Exception as e:
+        print(f"[voice_summary_node] LLM error: {e}")
+        summary = "Could not generate voice summary."
+
+    return {"voice_summary": summary}
+
+
+# ─────────────────────────────────────────────
 # GRAPH
 # ─────────────────────────────────────────────
 def build_graph():
@@ -666,6 +801,7 @@ def build_graph():
     graph.add_node("scrape",            scrape_node)
     graph.add_node("check_sufficiency", check_sufficiency_node)
     graph.add_node("generate_report",   generate_report_node)
+    graph.add_node("trend_compare",     trend_compare_node)
     graph.add_node("store_memory",      store_memory_node)
 
     graph.add_edge(START, "identify_brand")
@@ -674,7 +810,8 @@ def build_graph():
     graph.add_edge("scrape", "check_sufficiency")
     graph.add_conditional_edges("check_sufficiency", should_continue,
                                 {"search": "search", "generate": "generate_report"})
-    graph.add_edge("generate_report", "store_memory")
+    graph.add_edge("generate_report", "trend_compare")
+    graph.add_edge("trend_compare",   "store_memory")
     graph.add_edge("store_memory", END)
     return graph.compile()
 
@@ -707,6 +844,9 @@ def make_initial_state(brand_url: str, brand_name: str = "") -> ResearchState:
         "status_log":      [],
         "current_node":    "",
         "has_live_data":   False,
+        "voice_summary":   "",
+        "is_voice_mode":   False,
+        "trend_delta":     "",
     }
 
 

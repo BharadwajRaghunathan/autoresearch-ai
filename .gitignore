@@ -209,3 +209,6 @@ __marimo__/
 # AutoResearch AI — local data
 chroma_db/
 .claude/settings.local.json
+voice_response.mp3
+voice_greeting.mp3
+voice_ack.mp3
