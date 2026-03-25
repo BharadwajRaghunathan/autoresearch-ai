@@ -1610,7 +1610,7 @@ with tab4:
                     transcript = ""
 
             if transcript:
-                st.info(f"Heard: **{transcript}**")
+                st.info(f'Heard: **"{transcript}"**')
 
                 # Extract URL — prefer a bare domain/URL in the transcript,
                 # fall back to treating the whole transcript as a search hint
@@ -1635,7 +1635,11 @@ with tab4:
 
                 _run_voice_research(url_token, sidebar_stats_box)
             else:
-                st.warning("No speech detected. Try speaking louder or use the manual URL input below.")
+                st.warning(
+                    "Could not detect speech in the recording. "
+                    "Try speaking clearly and closer to the mic, "
+                    "or paste a URL in the text box below."
+                )
 
 
 

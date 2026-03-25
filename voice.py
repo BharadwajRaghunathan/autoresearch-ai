@@ -169,17 +169,49 @@ def _sarvam_client():
     return _sarvam_client_instance
 
 
+def _audio_extension(audio_bytes: bytes) -> str:
+    """
+    Detect audio format from magic bytes so the temp file gets the correct
+    extension — critical for Sarvam's multipart upload to set the right MIME type.
+
+    st.audio_input() returns different formats by browser/OS:
+      Chrome (desktop + Cloud): webm/opus  → .webm
+      Safari / iOS:             mp4/AAC    → .mp4
+      WAV (rare):               RIFF       → .wav
+    Sarvam supports: wav, mp3, ogg, flac, mp4, webm — falls back to .wav.
+    """
+    if audio_bytes[:4] == b"RIFF":
+        return ".wav"
+    if audio_bytes[:3] == b"ID3" or audio_bytes[:2] == b"\xff\xfb":
+        return ".mp3"
+    if audio_bytes[:4] == b"OggS":
+        return ".ogg"
+    if audio_bytes[:4] == b"fLaC":
+        return ".flac"
+    if audio_bytes[4:8] in (b"ftyp", b"moov") or audio_bytes[:4] == b"\x00\x00\x00\x18":
+        return ".mp4"
+    # WebM EBML header
+    if audio_bytes[:4] == b"\x1a\x45\xdf\xa3":
+        return ".webm"
+    return ".wav"  # safe default
+
+
 def transcribe_sarvam(audio_bytes: bytes) -> str:
     """
     Speech-to-text via Sarvam Saaras v3 SDK (latest recommended model).
 
-    Writes bytes to a temp file (SDK expects a file object),
-    returns the transcript string. Returns "" on any failure.
+    Detects the actual audio format from magic bytes before saving to temp file
+    so Sarvam receives the correct MIME type. On Streamlit Cloud, st.audio_input()
+    returns webm/opus (Chrome) not WAV — using .wav extension silently fails.
+
+    Returns transcript string. Returns "" on any failure — never raises.
     """
     tmp_path = None
     try:
-        client = _sarvam_client()
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        client   = _sarvam_client()
+        ext      = _audio_extension(audio_bytes)
+        print(f"[sarvam_stt] Detected audio format: {ext}")
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
             f.write(audio_bytes)
             tmp_path = f.name
         with open(tmp_path, "rb") as audio_file:
