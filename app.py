@@ -38,6 +38,7 @@ _SECRETS = [
     "GROQ_API_KEY", "TAVILY_API_KEY",
     "LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2", "LANGCHAIN_PROJECT",
     "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL",
+    "SARVAM_API_KEY",
 ]
 for _k in _SECRETS:
     if not os.environ.get(_k):
@@ -47,8 +48,20 @@ for _k in _SECRETS:
             pass  # secret not configured — downstream code degrades gracefully
 
 from langchain_core.messages import HumanMessage
-from agent import build_graph, make_initial_state, build_creative_graph, make_creative_state
+from agent import (
+    build_graph, make_initial_state,
+    build_creative_graph, make_creative_state,
+    voice_summary_node,
+)
 from chains import llm, langfuse_handler
+
+# Voice deps are optional — imported lazily so missing packages don't crash startup
+try:
+    from voice import transcribe_sarvam, speak_sarvam
+    _VOICE_AVAILABLE = True
+except ImportError:
+    _VOICE_AVAILABLE = False
+    VOICE_OPTIONS = {"Guy (US Male)": "en-US-GuyNeural"}
 
 st.set_page_config(page_title="AutoResearch AI", page_icon="🔍", layout="wide")
 
@@ -72,6 +85,7 @@ NODE_ORDER = [
     "scrape",
     "check_sufficiency",
     "generate_report",
+    "trend_compare",
     "store_memory",
 ]
 NODE_LABELS = {
@@ -80,6 +94,7 @@ NODE_LABELS = {
     "scrape":            "Scraping Websites",
     "check_sufficiency": "Checking Sufficiency",
     "generate_report":   "Generating Report",
+    "trend_compare":     "Trend Comparison",
     "store_memory":      "Saving to Memory",
 }
 
@@ -91,12 +106,20 @@ with st.sidebar:
     st.caption("Autonomous Marketing Intelligence Agent · Built by Bharadwaj R")
     st.divider()
     st.markdown("""
-**What it does:**
-1. Scrapes brand URL — extracts name & logo
+**Features:**
+- 🔍 **Research** — paste URL → 8-section competitor report
+- ⚔️ **Compare** — up to 3 brands in parallel + cross-brand summary
+- 🎨 **Creative Decoder** — decode any landing page creative strategy
+- 🎙️ **Voice** — speak a brand → agent researches & reads findings aloud
+
+**How the research agent works:**
+1. Scrapes brand URL — extracts name, logo & industry
 2. Searches competitors via Tavily (parallel)
 3. Scrapes competitor pages
 4. Loops until data is sufficient (max 3×)
 5. Generates 8-section intelligence report
+6. Compares with last run — surfaces what changed
+7. Saves to Chroma memory for future trend tracking
 
 **Observability:**
 - 📊 LangSmith — full agent traces
@@ -110,7 +133,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["🔍 Research", "⚔️ Compare Brands", "🔍 Creative Decoder"])
+tab1, tab2, tab3, tab4 = st.tabs(["🔍 Research", "⚔️ Compare Brands", "🎨 Creative Decoder", "🎙️ Voice Research"])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -604,6 +627,170 @@ def run_agent(brand_url: str, containers: dict, sidebar_stats) -> dict | None:
 
 
 # ─────────────────────────────────────────────
+# PDF EXPORT
+# ─────────────────────────────────────────────
+def _generate_pdf(result: dict, voice_summary: str = "", trend_delta: str = "") -> bytes:
+    """
+    Build a professional PDF from a completed research result dict.
+
+    Sections:
+      - Cover: brand name, website, industry, generated date
+      - Voice Summary (if present)
+      - Full 8-section report (markdown stripped to plain text)
+      - Footer with branding
+
+    Returns raw PDF bytes ready for st.download_button.
+    """
+    from fpdf import FPDF
+    from datetime import datetime
+    import re
+
+    def _strip_md(text: str) -> str:
+        """Remove markdown and sanitize to Latin-1 safe chars for fpdf Helvetica."""
+        text = re.sub(r"#{1,6}\s*", "", text)
+        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+        text = re.sub(r"\*(.+?)\*", r"\1", text)
+        text = re.sub(r"`(.+?)`", r"\1", text)
+        text = re.sub(r"---+", "", text)
+        text = re.sub(r"^\s*[-•*]\s*", "- ", text, flags=re.MULTILINE)
+        # Replace common Unicode chars that break Latin-1 / Helvetica
+        replacements = {
+            "\u2019": "'", "\u2018": "'", "\u201c": '"', "\u201d": '"',
+            "\u2014": "-", "\u2013": "-", "\u2022": "-", "\u2026": "...",
+            "\u00e2\u0080\u0099": "'", "\u00a0": " ",
+        }
+        for orig, repl in replacements.items():
+            text = text.replace(orig, repl)
+        # Final safety net — drop anything still outside Latin-1
+        text = text.encode("latin-1", errors="replace").decode("latin-1")
+        return text.strip()
+
+    brand   = result.get("brand_name", "Brand")
+    website = result.get("brand_website", result.get("brand_url", ""))
+    industry = result.get("brand_industry", "")
+    report  = result.get("final_report", "")
+    date    = datetime.now().strftime("%B %d, %Y")
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(20, 20, 20)
+
+    # ── Cover page ──────────────────────────────────────
+    pdf.add_page()
+
+    # Header bar
+    pdf.set_fill_color(15, 17, 23)      # dark bg
+    pdf.rect(0, 0, 210, 40, "F")
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_xy(20, 13)
+    pdf.cell(0, 10, "AutoResearch AI  ·  Competitor Intelligence Report", ln=True)
+
+    pdf.ln(18)
+
+    # Brand name
+    pdf.set_font("Helvetica", "B", 28)
+    pdf.set_text_color(15, 17, 23)
+    pdf.cell(0, 12, brand, ln=True)
+
+    # Meta line
+    pdf.set_font("Helvetica", "", 11)
+    pdf.set_text_color(100, 100, 110)
+    meta_parts = [p for p in [website, industry, date] if p]
+    pdf.cell(0, 8, "  ·  ".join(meta_parts), ln=True)
+
+    pdf.ln(4)
+    pdf.set_draw_color(108, 99, 255)   # purple accent
+    pdf.set_line_width(1.2)
+    pdf.line(20, pdf.get_y(), 190, pdf.get_y())
+    pdf.ln(8)
+
+    # ── Voice summary box ────────────────────────────────
+    if voice_summary:
+        pdf.set_fill_color(239, 246, 255)
+        pdf.set_draw_color(108, 99, 255)
+        pdf.set_line_width(0.4)
+        x, y = pdf.get_x(), pdf.get_y()
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(108, 99, 255)
+        pdf.cell(0, 6, "AGENT VOICE SUMMARY", ln=True)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(30, 30, 40)
+        pdf.multi_cell(0, 6, _strip_md(voice_summary), border=1, fill=True)
+        pdf.ln(6)
+
+    # ── Trend delta box (only on repeat runs) ────────────
+    if trend_delta:
+        pdf.set_fill_color(236, 253, 245)       # light green tint
+        pdf.set_draw_color(34, 197, 94)          # green border
+        pdf.set_line_width(0.4)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(34, 197, 94)
+        pdf.cell(0, 6, "WHAT CHANGED SINCE LAST RUN", ln=True)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(30, 30, 40)
+        pdf.multi_cell(0, 6, _strip_md(trend_delta), border=1, fill=True)
+        pdf.ln(6)
+
+    # ── Report sections ──────────────────────────────────
+    if report:
+        sections = re.split(r"\n(?=#{1,3}\s)", report)
+        for section in sections:
+            lines = section.strip().splitlines()
+            if not lines:
+                continue
+
+            first = lines[0].strip()
+            is_heading = first.startswith("#")
+
+            if is_heading:
+                heading_text = re.sub(r"^#{1,3}\s*", "", first).upper()
+                body_lines   = lines[1:]
+
+                # Section heading
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.set_text_color(255, 255, 255)
+                pdf.set_fill_color(15, 17, 23)
+                pdf.cell(0, 8, f"  {heading_text}", ln=True, fill=True)
+                pdf.ln(2)
+
+                body = _strip_md("\n".join(body_lines)).strip()
+                if body:
+                    pdf.set_font("Helvetica", "", 10)
+                    pdf.set_text_color(30, 30, 40)
+                    for line in body.splitlines():
+                        line = line.strip()
+                        if not line:
+                            pdf.ln(2)
+                            continue
+                        if line.startswith("•"):
+                            pdf.set_x(24)
+                            pdf.multi_cell(166, 5.5, line)
+                        else:
+                            pdf.multi_cell(0, 5.5, line)
+                pdf.ln(5)
+            else:
+                # Plain body block (no heading)
+                body = _strip_md(section).strip()
+                if body:
+                    pdf.set_font("Helvetica", "", 10)
+                    pdf.set_text_color(30, 30, 40)
+                    pdf.multi_cell(0, 5.5, body)
+                    pdf.ln(3)
+
+    # ── Footer on last page ──────────────────────────────
+    pdf.set_y(-20)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(150, 150, 160)
+    pdf.cell(0, 6,
+        f"Generated by AutoResearch AI  ·  {date}  ·  LangGraph + Groq + Tavily  ·  Data from public web",
+        align="C",
+    )
+
+    return bytes(pdf.output())
+
+
+# ─────────────────────────────────────────────
 # REPORT RENDERER (Tab 1)
 # ─────────────────────────────────────────────
 def display_report(result: dict, brand_name: str):
@@ -624,7 +811,14 @@ def display_report(result: dict, brand_name: str):
     else:
         st.warning("⚠️ No live data retrieved. Report is AI estimate from training knowledge.")
 
-    st.divider()
+    # ── Trend delta panel (only shown on second+ run) ──
+    trend = result.get("trend_delta", "")
+    if trend:
+        with st.expander("📈 What Changed Since Last Run", expanded=True):
+            st.markdown(trend)
+        st.divider()
+    else:
+        st.caption("💡 **Trend Tracker:** Run this brand again later to see what changed in the competitive landscape.")
 
     SECTIONS = [
         ("1.", "🏆 Top Competitors Identified"),
@@ -963,6 +1157,101 @@ def display_creative_report(result: dict):
                 st.markdown("*Section not found in report.*")
 
 
+# ─────────────────────────────────────────────
+# VOICE RESEARCH HELPER
+# ─────────────────────────────────────────────
+
+def _run_voice_research(url: str, sidebar_stats) -> None:
+    """
+    Run the full research graph from a voice (or text-fallback) URL, then:
+    1. Generate a spoken summary via voice_summary_node
+    2. Synthesise the summary to WAV bytes via Sarvam Bulbul TTS
+    3. Autoplay in the UI
+    4. Render the full report below
+
+    Reuses run_agent() and display_report() so voice mode is just a thin wrapper —
+    no duplicate research logic.
+    """
+    raw = url.strip()
+    if not raw:
+        st.warning("No URL detected in transcript.")
+        return
+    if " " in raw or ("." not in raw and not raw.startswith(("http://", "https://"))):
+        st.error(f"Could not extract a valid URL from transcript: '{raw}'. Try the manual input below.")
+        return
+
+    v_header   = st.empty()
+    v_timeline = st.empty()
+    v_activity = st.empty()
+    v_card     = st.empty()
+
+    result = run_agent(
+        raw,
+        containers={
+            "header":     v_header,
+            "timeline":   v_timeline,
+            "activity":   v_activity,
+            "brand_card": v_card,
+        },
+        sidebar_stats=sidebar_stats,
+    )
+    v_card.empty()
+
+    if not result:
+        st.error("Research failed — no result returned.")
+        return
+
+    # ── Generate spoken summary ──
+    with st.spinner("Generating spoken summary..."):
+        voice_state = voice_summary_node(result)
+        summary_text = voice_state.get("voice_summary", "")
+
+    if summary_text:
+        st.markdown("### What the agent found")
+        st.info(summary_text)
+
+        # ── Synthesise and autoplay via Sarvam Bulbul ──
+        try:
+            audio_bytes = speak_sarvam(summary_text)
+            if audio_bytes:
+                st.audio(audio_bytes, format="audio/wav", autoplay=True)
+        except Exception as e:
+            st.warning(f"Text-to-speech failed: {e}")
+
+    # ── Speak trend delta if this is a repeat run ──
+    trend_delta = result.get("trend_delta", "")
+    if trend_delta:
+        # Condense trend delta to a spoken sentence (already plain text from LLM)
+        import re as _re
+        trend_spoken = _re.sub(r"\*\*(.+?)\*\*", r"\1", trend_delta)  # strip bold
+        trend_spoken = " ".join(trend_spoken.split())[:400]            # cap at 400 chars
+        trend_spoken = "Here is what changed since your last research. " + trend_spoken
+        try:
+            trend_audio = speak_sarvam(trend_spoken)
+            if trend_audio:
+                st.markdown("### What changed since last time")
+                st.audio(trend_audio, format="audio/wav", autoplay=False)
+        except Exception:
+            pass  # silent — trend panel still shows in display_report below
+
+    st.divider()
+    display_report(result, result.get("brand_name", raw))
+
+    # ── PDF export ──
+    try:
+        pdf_bytes = _generate_pdf(result, voice_summary=summary_text, trend_delta=trend_delta)
+        brand_slug = result.get("brand_name", "report").lower().replace(" ", "_")
+        st.download_button(
+            label="⬇️ Download Report as PDF",
+            data=pdf_bytes,
+            file_name=f"{brand_slug}_competitor_report.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    except Exception as e:
+        st.caption(f"PDF export unavailable: {e}")
+
+
 # ═══════════════════════════════════════════════
 # TAB 1 — SINGLE BRAND RESEARCH
 # ═══════════════════════════════════════════════
@@ -1281,6 +1570,73 @@ with tab3:
                 )
                 st.divider()
                 display_creative_report(creative_result)
+
+
+# ═══════════════════════════════════════════════
+# TAB 4 — VOICE RESEARCH
+# ═══════════════════════════════════════════════
+with tab4:
+    st.header("Voice Research")
+    st.caption(
+        "Speak a brand name — the agent researches it and reads the key findings aloud. "
+        "Full report renders below."
+    )
+
+    if not _VOICE_AVAILABLE:
+        st.warning("Voice module failed to import — check voice.py.")
+    elif not os.environ.get("SARVAM_API_KEY"):
+        st.warning("SARVAM_API_KEY is not set. Add it to your .env or Streamlit secrets.")
+    else:
+        v_col1, v_col2 = st.columns([4, 1])
+        with v_col1:
+            audio_input = st.audio_input("Speak a brand name or URL")
+        with v_col2:
+            st.write("")
+            voice_btn = st.button(
+                "Transcribe & Research",
+                type="primary",
+                use_container_width=True,
+                key="run_voice",
+                disabled=(audio_input is None),
+            )
+
+        # ── Process: mic path ──
+        if voice_btn and audio_input is not None:
+            with st.spinner("Transcribing audio..."):
+                try:
+                    transcript = transcribe_sarvam(audio_input.getvalue())
+                except Exception as e:
+                    st.error(f"Transcription failed: {e}")
+                    transcript = ""
+
+            if transcript:
+                st.info(f"Heard: **{transcript}**")
+
+                # Extract URL — prefer a bare domain/URL in the transcript,
+                # fall back to treating the whole transcript as a search hint
+                words     = transcript.split()
+                url_token = next(
+                    (w for w in words if "." in w and " " not in w),
+                    transcript.strip(),
+                )
+                if not url_token.startswith(("http://", "https://")):
+                    url_token = "https://" + url_token.lstrip("/")
+
+                # ── Acknowledgment — agent confirms it heard the request ──
+                brand_hint = url_token.replace("https://", "").replace("http://", "").split("/")[0]
+                try:
+                    ack_bytes = speak_sarvam(
+                        f"Sure! I'll go and research {brand_hint} for you right now. Give me a moment."
+                    )
+                    if ack_bytes:
+                        st.audio(ack_bytes, format="audio/wav", autoplay=True)
+                except Exception:
+                    pass  # ack failure is silent
+
+                _run_voice_research(url_token, sidebar_stats_box)
+            else:
+                st.warning("No speech detected. Try speaking louder or use the manual URL input below.")
+
 
 
 # ─────────────────────────────────────────────
