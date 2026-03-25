@@ -1637,8 +1637,8 @@ with tab4:
             else:
                 st.warning(
                     "Could not detect speech in the recording. "
-                    "Try speaking clearly and closer to the mic, "
-                    "or paste a URL in the text box below."
+                    "Try speaking clearly and a bit louder — "
+                    "or use the **Research tab** to paste the URL directly."
                 )
 
 
