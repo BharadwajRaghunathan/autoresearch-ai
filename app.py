@@ -1156,6 +1156,38 @@ def display_creative_report(result: dict):
             else:
                 st.markdown("*Section not found in report.*")
 
+    # ── Ad Copy Variants ──
+    variants = result.get("ad_variants", [])
+    if variants:
+        st.divider()
+        st.markdown(
+            f"<div style='font-size:18px; font-weight:700; color:{C_PURPLE}; margin-bottom:4px;'>"
+            "📢 Ad Copy Generator</div>"
+            "<div style='font-size:13px; color:#94a3b8; margin-bottom:16px;'>"
+            "3 platform-specific ads written to exploit the competitor's weakest dimensions</div>",
+            unsafe_allow_html=True,
+        )
+        cols = st.columns(len(variants))
+        for col, v in zip(cols, variants):
+            platform = v.get("platform", "")
+            weakness = v.get("weakness_targeted", "")
+            hook     = v.get("hook", "")
+            body     = v.get("body", "")
+            cta      = v.get("cta", "")
+            angle    = v.get("angle", "")
+            platform_icon = {"Facebook Feed": "📘", "Instagram Story": "📸", "Google Search Ad": "🔍"}.get(platform, "📢")
+            col.markdown(
+                f"""<div style="background:{C_BG}; border:1px solid {C_PURPLE}55; border-radius:12px; padding:18px; height:100%;">
+  <div style="font-size:11px; font-weight:700; color:{C_PURPLE}; text-transform:uppercase; letter-spacing:1px; margin-bottom:4px;">{platform_icon} {platform}</div>
+  <div style="font-size:10px; color:#64748b; margin-bottom:14px; font-style:italic;">Targets: {weakness}</div>
+  <div style="font-size:13px; font-weight:700; color:#e2e8f0; margin-bottom:8px; line-height:1.4;">"{hook}"</div>
+  <div style="font-size:12px; color:#94a3b8; margin-bottom:12px; line-height:1.6;">{body}</div>
+  <div style="background:{C_PURPLE}22; border:1px solid {C_PURPLE}44; border-radius:6px; padding:8px 12px; text-align:center; font-size:12px; font-weight:700; color:{C_PURPLE}; margin-bottom:12px;">{cta}</div>
+  <div style="font-size:10px; color:#64748b; font-style:italic; border-top:1px solid #1e1e2e; padding-top:10px; line-height:1.5;">💡 {angle}</div>
+</div>""",
+                unsafe_allow_html=True,
+            )
+
 
 # ─────────────────────────────────────────────
 # VOICE RESEARCH HELPER

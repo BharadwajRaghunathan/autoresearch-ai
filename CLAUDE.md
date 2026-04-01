@@ -35,12 +35,12 @@ identify_brand → search → scrape → check_sufficiency → generate_report �
 - `trend_compare` node: no-op on first run; diffs current vs previous Chroma report on repeat runs
 - Streaming: every node emits `current_node` + `status_log` entries — app.py polls these
 
-### build_creative_graph() — Creative Decoder (5 nodes)
+### build_creative_graph() — Creative Decoder (6 nodes)
 ```
-scrape_creative → analyse_creative → score_creative → verdict_creative → store_creative_memory
+scrape_creative → analyse_creative → score_creative → verdict_creative → generate_ad_variants → store_creative_memory
 ```
-- State: `CreativeState` (url, industry, headlines, plan_names, ctas, meta_title, meta_description, image_alts, price_mentions, raw_content, word_count, creative_report, creative_scores, creative_verdict, pages_scraped, used_tavily_fallback, status_log, current_node)
-- Three sequential LLM calls: analyse → score → verdict
+- State: `CreativeState` (url, industry, headlines, plan_names, ctas, meta_title, meta_description, image_alts, price_mentions, raw_content, word_count, creative_report, creative_scores, creative_verdict, ad_variants, pages_scraped, used_tavily_fallback, status_log, current_node)
+- Four sequential LLM calls: analyse → score → verdict → generate_ad_variants
 
 ### Voice Research — not a separate graph
 ```
@@ -68,6 +68,7 @@ st.audio_input → transcribe() → run_agent() [existing graph] → voice_summa
 | `analyse-creative` | analyse_creative | Creative |
 | `score-creative` | score_creative | Creative |
 | `verdict-creative` | verdict_creative | Creative |
+| `generate-ad-variants` | generate_ad_variants_node | Creative |
 | `voice-summary` | voice_summary_node | Voice (standalone) |
 | `trend-compare` | trend_compare_node | Research (node 6) |
 

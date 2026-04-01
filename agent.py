@@ -882,6 +882,7 @@ class CreativeState(TypedDict):
     creative_report:      str    # 7-section markdown from analyse node
     creative_scores:  dict    # {clarity, reason, emotional_impact, reason, cta_effectiveness, reason, trust_signals, reason, overall}
     creative_verdict: str     # one-sentence summary of biggest strength + weakness
+    ad_variants:      list    # 3 platform-specific ad copy variants from generate_ad_variants node
     status_log:       list
     current_node:     str
 
@@ -1005,6 +1006,39 @@ Scores:
 Write EXACTLY ONE sentence (max 25 words) that identifies the biggest strength AND the biggest weakness.
 Format: "[strength] — [weakness and how a competitor could exploit it]"
 No markdown. No labels. Just the sentence.\
+"""
+
+_GENERATE_AD_VARIANTS_FALLBACK = """\
+You are an expert performance marketing copywriter for SMB Facebook, Instagram, and Google ads.
+
+COMPETITOR ANALYSIS:
+{creative_analysis}
+
+WEAK DIMENSIONS (scored 5 or below out of 10):
+{weak_dimensions}
+
+ONE-LINE VERDICT:
+{verdict}
+
+BRAND URL ANALYSED:
+{brand_url}
+
+Write 3 ad copy variants. Each variant targets a different weakness and a different platform.
+Rules:
+- Hook: single punchy sentence under 12 words
+- Body: 2-3 sentences max, one specific benefit or contrast
+- CTA: action phrase under 6 words
+- Angle: one sentence explaining the strategic gap exploited
+- Never name the competitor directly in the copy
+- Never invent features — only use what the analysis found
+- Write for a busy SMB owner — time-poor, results-focused
+
+Return ONLY valid JSON, no markdown, no explanation:
+{{"variants": [
+  {{"variant_number": 1, "platform": "Facebook Feed", "weakness_targeted": "...", "hook": "...", "body": "...", "cta": "...", "angle": "..."}},
+  {{"variant_number": 2, "platform": "Instagram Story", "weakness_targeted": "...", "hook": "...", "body": "...", "cta": "...", "angle": "..."}},
+  {{"variant_number": 3, "platform": "Google Search Ad", "weakness_targeted": "...", "hook": "...", "body": "...", "cta": "...", "angle": "..."}}
+]}}\
 """
 
 
@@ -1205,7 +1239,74 @@ def verdict_creative_node(state: CreativeState) -> CreativeState:
 
 
 # ─────────────────────────────────────────────
-# CREATIVE NODE 5: store_creative_memory
+# CREATIVE NODE 5: generate_ad_variants
+# ─────────────────────────────────────────────
+def generate_ad_variants_node(state: CreativeState) -> dict:
+    """
+    Generate 3 platform-specific ad copy variants that exploit the competitor's
+    weaknesses identified in the scorecard.
+
+    Reads creative_scores to find dimensions scored ≤5 — these are the gaps
+    a competing SMB can target. Produces one variant per platform:
+    Facebook Feed, Instagram Story, Google Search Ad.
+
+    Falls back gracefully to [] if LLM output is not valid JSON.
+    """
+    log_entry = "Generating ad copy variants..."
+    print(log_entry)
+
+    scores = state.get("creative_scores", {})
+    score_keys = ["clarity", "emotional_impact", "cta_effectiveness", "trust_signals"]
+    weak_dimensions = [
+        f"{k.replace('_', ' ').title()} (score: {scores.get(k, 0)}/10)"
+        for k in score_keys
+        if float(scores.get(k, 10)) <= 5
+    ]
+    # Always have at least 2 dimensions to work with
+    if len(weak_dimensions) < 2:
+        sorted_scores = sorted(
+            [(k, float(scores.get(k, 0))) for k in score_keys],
+            key=lambda x: x[1],
+        )
+        weak_dimensions = [
+            f"{k.replace('_', ' ').title()} (score: {v}/10)"
+            for k, v in sorted_scores[:2]
+        ]
+
+    weak_str = "\n".join(f"- {d}" for d in weak_dimensions)
+
+    prompt = get_langfuse_prompt(
+        "generate-ad-variants",
+        _GENERATE_AD_VARIANTS_FALLBACK,
+        creative_analysis=state.get("creative_report", "")[:2000],
+        weak_dimensions=weak_str,
+        verdict=state.get("creative_verdict", ""),
+        brand_url=state.get("url", ""),
+    )
+    response = llm.invoke(
+        [HumanMessage(content=prompt)],
+        config={"callbacks": [langfuse_handler], "run_name": "generate_ad_variants"},
+    )
+
+    variants: list = []
+    try:
+        raw = response.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(raw)
+        variants = parsed.get("variants", [])
+    except Exception as e:
+        print(f"[generate_ad_variants] JSON parse error: {e}")
+
+    print(f"[generate_ad_variants] Generated {len(variants)} variants")
+    return {
+        "ad_variants":  variants,
+        "current_node": "generate_ad_variants",
+        "status_log":   state.get("status_log", []) + [log_entry],
+    }
+
+
+# ─────────────────────────────────────────────
+# CREATIVE NODE 6: store_creative_memory
 # ─────────────────────────────────────────────
 def store_creative_memory_node(state: CreativeState) -> CreativeState:
     """
@@ -1240,13 +1341,15 @@ def build_creative_graph():
     graph.add_node("analyse_creative",       analyse_creative_node)
     graph.add_node("score_creative",         score_creative_node)
     graph.add_node("verdict_creative",       verdict_creative_node)
+    graph.add_node("generate_ad_variants",   generate_ad_variants_node)
     graph.add_node("store_creative_memory",  store_creative_memory_node)
 
     graph.add_edge(START, "scrape_creative")
     graph.add_edge("scrape_creative",       "analyse_creative")
     graph.add_edge("analyse_creative",      "score_creative")
     graph.add_edge("score_creative",        "verdict_creative")
-    graph.add_edge("verdict_creative",      "store_creative_memory")
+    graph.add_edge("verdict_creative",      "generate_ad_variants")
+    graph.add_edge("generate_ad_variants",  "store_creative_memory")
     graph.add_edge("store_creative_memory", END)
     return graph.compile()
 
@@ -1272,6 +1375,7 @@ def make_creative_state(url: str, industry: str = "") -> CreativeState:
         "creative_report":      "",
         "creative_scores":  {},
         "creative_verdict": "",
+        "ad_variants":      [],
         "status_log":       [],
         "current_node":     "",
     }
